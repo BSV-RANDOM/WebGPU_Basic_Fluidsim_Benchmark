@@ -79,12 +79,7 @@ async function initWebGPU() {
     // Request float32-filterable if available.  We only use textureLoad
     // (no sampler) so this is not strictly required, but it signals to the
     // driver that we intend to work with 32-bit float render targets.
-    const wantedFeatures = [];
-    if (adapter.features.has('float32-renderable')) {
-        wantedFeatures.push('float32-renderable');
-    } else {
-        alert('WARNING: Your device does not support float32-renderable! The simulation will fail.');
-    }
+    const wantedFeatures = []; // FIX: webgpu doesnt support 32bit textures
     device = await adapter.requestDevice({ requiredFeatures: wantedFeatures });
 
     device.addEventListener('uncapturederror', ev => {
@@ -156,7 +151,7 @@ async function buildPipelineAndStart(isRenderMode) {
     // -------------------------------------------------------------------------
     // 3.3  Texture helpers  (mirrors WebGL2's createDataTexture / createFBO)
     // -------------------------------------------------------------------------
-    const DATA_TEX_FORMAT = 'rgba32float'; // same as WebGL2's RGBA32F
+    const DATA_TEX_FORMAT = 'rgba16float'; //turns out webgpu doesnt like 32 bit textures.
 
     function createDataTexture(width, height, initData /*Float32Array|null*/) {
         const tex = device.createTexture({
