@@ -129,6 +129,8 @@ async function buildPipelineAndStart(isRenderMode) {
     const STR_GRID_WIDTH      = GRID_WIDTH.toString();
     const STR_Z_MULT          = (WORLD_SIZE * WORLD_SIZE).toString();
     const STR_HALF_WORLD      = (WORLD_SIZE / 2.0).toFixed(1);
+    const WORKGROUP_SIZE      = 64;
+    const STR_WG_SIZE         = WORKGROUP_SIZE.toString();
 
     // -------------------------------------------------------------------------
     // 3.2  Vertex buffer for the full-screen quad
@@ -151,78 +153,52 @@ async function buildPipelineAndStart(isRenderMode) {
     // -------------------------------------------------------------------------
     // 3.3  Texture helpers  (mirrors WebGL2's createDataTexture / createFBO)
     // -------------------------------------------------------------------------
-    const DATA_TEX_FORMAT = 'rgba16float'; //turns out webgpu doesnt like 32 bit textures.
-
-    function createDataTexture(width, height, initData /*Float32Array|null*/) {
-        const tex = device.createTexture({
-            size:   [width, height, 1],
-            format: DATA_TEX_FORMAT,
-            // TEXTURE_BINDING = sampler/textureLoad read
-            // RENDER_ATTACHMENT = write via render pass (replaces FBO)
-            // COPY_SRC / COPY_DST for the sync-barrier readback trick
-            usage:  GPUTextureUsage.TEXTURE_BINDING  |
-                    GPUTextureUsage.RENDER_ATTACHMENT |
-                    GPUTextureUsage.COPY_SRC          |
-                    GPUTextureUsage.COPY_DST,
+    // Helper: Creates a Storage Buffer (identically sized to the WebGL textures)
+    function createStorageBuffer(elementCount, initData) {
+        const byteSize = elementCount * 4 * 4; // vec4f (4 floats) * 4 bytes
+        const buf = device.createBuffer({
+            size: byteSize,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         });
         if (initData) {
-            device.queue.writeTexture(
-                { texture: tex },
-                initData,
-                { bytesPerRow: width * 4 * 4 },   // 4 channels × 4 bytes
-                [width, height, 1]
-            );
+            device.queue.writeBuffer(buf, 0, initData);
         }
-        return tex;
+        return buf;
     }
 
-    // In WebGPU there is no separate FBO object; the texture IS the render target.
-    // We simply reference the texture directly in the render pass descriptor.
-    // No createFBO() helper is needed.
-
-    // -------------------------------------------------------------------------
-    // 3.4  Particle data init  (identical math to WebGL2)
-    // -------------------------------------------------------------------------
     const initialPositions  = new Float32Array(PARTICLE_COUNT * 4);
     const initialVelocities = new Float32Array(PARTICLE_COUNT * 4); // all zeros
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-        // Dam-break scenario: left half of volume
         initialPositions[i * 4 + 0] = Math.random() * (WORLD_SIZE / 2.0);
         initialPositions[i * 4 + 1] = Math.random() * WORLD_SIZE;
         initialPositions[i * 4 + 2] = Math.random() * WORLD_SIZE;
-        initialPositions[i * 4 + 3] = i; // original index stored in w
+        initialPositions[i * 4 + 3] = i; 
     }
 
-    // -------------------------------------------------------------------------
-    // 3.5  Ping-pong textures  (replaces posTexA/B, velTexA/B + their FBOs)
-    // -------------------------------------------------------------------------
-    const posTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialPositions);
-    const posTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
-    const velTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialVelocities);
-    const velTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+    const posBufA = createStorageBuffer(PARTICLE_COUNT, initialPositions);
+    const posBufB = createStorageBuffer(PARTICLE_COUNT, null);
+    const velBufA = createStorageBuffer(PARTICLE_COUNT, initialVelocities);
+    const velBufB = createStorageBuffer(PARTICLE_COUNT, null);
 
-    // Sort ping-pong buffers
     const initialSortData = new Float32Array(PARTICLE_COUNT * 4);
     for (let i = 0; i < PARTICLE_COUNT; i++) {
-        initialSortData[i * 4 + 1] = i; // particle ID in .y, cell index .x = 0
+        initialSortData[i * 4 + 1] = i; 
     }
-    const sortTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialSortData);
-    const sortTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+    const sortBufA = createStorageBuffer(PARTICLE_COUNT, initialSortData);
+    const sortBufB = createStorageBuffer(PARTICLE_COUNT, null);
 
-    // Grid lookup texture (one cell per texel)
-    const gridTex    = createDataTexture(GRID_WIDTH,  GRID_HEIGHT,  null);
-    // Density texture
-    const densityTex = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+    // Grid size is GRID_WIDTH * GRID_HEIGHT
+    const gridBuf    = createStorageBuffer(GRID_WIDTH * GRID_HEIGHT, null);
+    const densityBuf = createStorageBuffer(PARTICLE_COUNT, null);
 
-    // State tracking – exactly mirrors WebGL2's readState / writeState objects
-    let readState  = { posTex: posTexA, velTex: velTexA };
-    let writeState = { posTex: posTexB, velTex: velTexB };
+    let readState  = { posBuf: posBufA, velBuf: velBufA };
+    let writeState = { posBuf: posBufB, velBuf: velBufB };
 
     function swapPingPong() {
         const prev = readState;
-        readState  = { posTex: writeState.posTex, velTex: writeState.velTex };
-        writeState = { posTex: prev.posTex,        velTex: prev.velTex        };
+        readState  = { posBuf: writeState.posBuf, velBuf: writeState.velBuf };
+        writeState = { posBuf: prev.posBuf,       velBuf: prev.velBuf       };
     }
 
     // -------------------------------------------------------------------------
@@ -239,12 +215,12 @@ async function buildPipelineAndStart(isRenderMode) {
 
     // One tiny uniform buffer per (k,j) pair, written once at startup.
     // 16 bytes = minimum uniform buffer size in WebGPU.
-    const sortUniformBuffers = sortIterations.map(({ k, j }) => {
+   const sortUniformBuffers = sortIterations.map(({ k, j }) => {
         const buf = device.createBuffer({
             size:  16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        device.queue.writeBuffer(buf, 0, new Int32Array([k, j, 0, 0]));
+        device.queue.writeBuffer(buf, 0, new Uint32Array([k, j, 0, 0]));
         return buf;
     });
 
@@ -286,44 +262,26 @@ async function buildPipelineAndStart(isRenderMode) {
     //      Mirrors WebGL2's quadVertexShaderSource exactly.
     //      Uses @location(0) to match the vertex buffer layout above.
     // -------------------------------------------------------------------------
-    const QUAD_VS = /* wgsl */`
-struct VsOut {
-    @builtin(position) position : vec4f,
-    @location(0)       texCoord : vec2f,
-}
-@vertex
-fn vs_main(@location(0) a_position: vec2f) -> VsOut {
-    var o: VsOut;
-    o.position = vec4f(a_position, 0.0, 1.0);
-    // Identical UV calculation to WebGL2: v_texCoord = a_position * 0.5 + 0.5
-    o.texCoord = a_position * 0.5 + 0.5;
-    return o;
-}
-`;
+   const HASH_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read> u_posBuf  : array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> u_sortBuf : array<vec4f>;
 
-    // -------------------------------------------------------------------------
-    // 4.2  Hash pass  (spatial hashing — mirrors hashFsSource)
-    //      Reads position texture, outputs (cellIndex, particleId, 0, 0)
-    // -------------------------------------------------------------------------
-    const HASH_FS = /* wgsl */`
-@group(0) @binding(0) var u_posTex : texture_2d<f32>;
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let id = global_id.x;
+    if (id >= u32(${STR_TOTAL_PARTICLES})) { return; }
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc      = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let posData = textureLoad(u_posTex, pc, 0);
+    let posData    = u_posBuf[id];
     let pos        = posData.xyz;
     let particleId = posData.w;
 
-    // Defensive clamp identical to WebGL2's DEFENSIVE DEBUGGING block
     let clampedPos = clamp(pos, vec3f(0.0), vec3f(${STR_WORLD_BOUND}));
     let cell3D     = floor(clampedPos);
     let cellIndex  = cell3D.x
                    + cell3D.y * ${STR_WORLD_SIZE}
                    + cell3D.z * f32(${STR_Z_MULT});
 
-    // R = cellIndex (sort key), G = particleId (payload)
-    return vec4f(cellIndex, particleId, 0.0, 0.0);
+    u_sortBuf[id] = vec4f(cellIndex, particleId, 0.0, 0.0);
 }
 `;
 
@@ -331,70 +289,65 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     // 4.3  Bitonic sort pass  (mirrors sortFsSource)
     //      k and j come from a uniform buffer (one per iteration).
     // -------------------------------------------------------------------------
-    const SORT_FS = /* wgsl */`
+    const SORT_CS = /* wgsl */`
 struct SortParams {
-    k : i32,
-    j : i32,
+    k : u32,
+    j : u32,
 }
-@group(0) @binding(0) var<uniform>  params   : SortParams;
-@group(0) @binding(1) var           u_sortTex: texture_2d<f32>;
+@group(0) @binding(0) var<uniform> params : SortParams;
+@group(0) @binding(1) var<storage, read> u_sortIn : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> u_sortOut : array<vec4f>;
 
-const TEXT_WIDTH : i32 = ${STR_TEXT_WIDTH};
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let id = global_id.x;
+    if (id >= u32(${STR_TOTAL_PARTICLES})) { return; }
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc        = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let id        = pc.y * TEXT_WIDTH + pc.x;
     let partnerId = id ^ params.j;
 
-    let partnerCoord = vec2i(partnerId % TEXT_WIDTH, partnerId / TEXT_WIDTH);
-
-    let myData      = textureLoad(u_sortTex, pc,          0);
-    let partnerData = textureLoad(u_sortTex, partnerCoord, 0);
+    let myData      = u_sortIn[id];
+    let partnerData = u_sortIn[partnerId];
 
     let myKey      = myData.x;
     let partnerKey = partnerData.x;
 
-    // (id & k) == 0  means ascending block  (identical to WebGL2)
-    let ascending = (id & params.k) == 0;
+    let ascending = (id & params.k) == 0u;
     var result    = myData;
 
     if (partnerId > id) {
-        // Left element: swap if wrong order for our direction
-        // WGSL select(falseVal, trueVal, cond) ≡ cond ? trueVal : falseVal
-        if (select(myKey < partnerKey, myKey > partnerKey, ascending)) {
+        if ((ascending && myKey > partnerKey) || (!ascending && myKey < partnerKey)) {
             result = partnerData;
         }
     } else {
-        // Right element
-        if (select(myKey > partnerKey, myKey < partnerKey, ascending)) {
+        if ((ascending && myKey < partnerKey) || (!ascending && myKey > partnerKey)) {
             result = partnerData;
         }
     }
-    return result;
+    u_sortOut[id] = result;
 }
 `;
 
     // -------------------------------------------------------------------------
     // 4.4  Grid scanner pass  (binary search — mirrors scanFsSource)
     // -------------------------------------------------------------------------
-    const SCAN_FS = /* wgsl */`
-@group(0) @binding(0) var u_sortTex : texture_2d<f32>;
+    const SCAN_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read> u_sortBuf : array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> u_gridBuf : array<vec4f>;
 
-const TEXT_WIDTH      : i32 = ${STR_TEXT_WIDTH};
 const TOTAL_PARTICLES : i32 = ${STR_TOTAL_PARTICLES};
-const GRID_W          : i32 = ${STR_GRID_WIDTH};
 const SCAN_STEPS      : i32 = ${STR_SCAN_STEPS};
+const TOTAL_CELLS     : u32 = ${GRID_WIDTH * GRID_HEIGHT};
 
 fn getCellAt(index: i32) -> i32 {
-    let uv = vec2i(index % TEXT_WIDTH, index / TEXT_WIDTH);
-    return i32(textureLoad(u_sortTex, uv, 0).x);
+    return i32(u_sortBuf[index].x);
 }
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc         = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let targetCell = pc.y * GRID_W + pc.x;
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let targetCellId = global_id.x;
+    if (targetCellId >= TOTAL_CELLS) { return; }
+
+    let targetCell = i32(targetCellId);
 
     // ---- Binary search for FIRST occurrence ----
     var low        = 0;
@@ -442,8 +395,7 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
         count = f32(lastIndex - firstIndex + 1);
     }
 
-    // R = startIndex, G = count  (mirrors WebGL2 outColor)
-    return vec4f(startIdx, count, 0.0, 0.0);
+    u_gridBuf[targetCellId] = vec4f(startIdx, count, 0.0, 0.0);
 }
 `;
 
@@ -451,20 +403,17 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     // 4.5  Density pass  (27-cell neighbour search — mirrors densityFsSource)
     //      H=1.0 so H9=1.0; POLY6 computed at compile time.
     // -------------------------------------------------------------------------
-    const DENSITY_FS = /* wgsl */`
-@group(0) @binding(0) var u_posTex  : texture_2d<f32>;
-@group(0) @binding(1) var u_sortTex : texture_2d<f32>;
-@group(0) @binding(2) var u_gridTex : texture_2d<f32>;
+    const DENSITY_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read> u_posBuf : array<vec4f>;
+@group(0) @binding(1) var<storage, read> u_sortBuf : array<vec4f>;
+@group(0) @binding(2) var<storage, read> u_gridBuf : array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> u_densityBuf : array<vec4f>;
 
-const TEXT_WIDTH  : i32 = ${STR_TEXT_WIDTH};
 const WORLD_MAX   : i32 = ${STR_WORLD_MAX};
-const GRID_W      : i32 = ${STR_GRID_WIDTH};
 const Z_MULT      : i32 = ${STR_Z_MULT};
-
 const H    : f32 = 1.0;
 const MASS : f32 = 1.0;
-const H2   : f32 = 1.0;  // H*H  = 1.0
-// POLY6 = 315 / (64 * PI * H^9),  H^9 = 1.0
+const H2   : f32 = 1.0;
 const POLY6 : f32 = 315.0 / (64.0 * 3.14159265358979 * 1.0);
 
 fn cellIndex(cell: vec3i) -> i32 {
@@ -472,10 +421,12 @@ fn cellIndex(cell: vec3i) -> i32 {
     return c.x + c.y * (WORLD_MAX + 1) + c.z * Z_MULT;
 }
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc    = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let myPos = textureLoad(u_posTex, pc, 0).xyz;
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let id = global_id.x;
+    if (id >= u32(${STR_TOTAL_PARTICLES})) { return; }
+
+    let myPos = u_posBuf[id].xyz;
     let myCell = vec3i(i32(floor(myPos.x)),
                        i32(floor(myPos.y)),
                        i32(floor(myPos.z)));
@@ -490,18 +441,15 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
             nc.z < 0 || nc.z > WORLD_MAX) { continue; }
 
         let ci       = cellIndex(nc);
-        let gridUV   = vec2i(ci % GRID_W, ci / GRID_W);
-        let gridData = textureLoad(u_gridTex, gridUV, 0);
+        let gridData = u_gridBuf[ci];
         let startIdx = i32(gridData.x);
         let count    = i32(gridData.y);
 
         if (count > 0) {
             for (var i = 0; i < count; i++) {
                 let si         = startIdx + i;
-                let sortUV     = vec2i(si % TEXT_WIDTH, si / TEXT_WIDTH);
-                let originalId = i32(textureLoad(u_sortTex, sortUV, 0).y);
-                let nUV        = vec2i(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
-                let nPos       = textureLoad(u_posTex, nUV, 0).xyz;
+                let originalId = u32(u_sortBuf[si].y);
+                let nPos       = u_posBuf[originalId].xyz;
 
                 let diff = myPos - nPos;
                 let r2   = dot(diff, diff);
@@ -511,26 +459,25 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
                 }
             }
         }
-    }}}  // end 27-cell loops
+    }}} 
 
     myDensity = max(myDensity, 0.0001);
-    return vec4f(myDensity, 0.0, 0.0, 0.0);
+    u_densityBuf[id] = vec4f(myDensity, 0.0, 0.0, 0.0);
 }
 `;
 
     // -------------------------------------------------------------------------
     // 4.6  Force pass  (pressure + viscosity — mirrors forceFsSource)
     // -------------------------------------------------------------------------
-    const FORCE_FS = /* wgsl */`
-@group(0) @binding(0) var u_posTex     : texture_2d<f32>;
-@group(0) @binding(1) var u_velTex     : texture_2d<f32>;
-@group(0) @binding(2) var u_densityTex : texture_2d<f32>;
-@group(0) @binding(3) var u_sortTex    : texture_2d<f32>;
-@group(0) @binding(4) var u_gridTex    : texture_2d<f32>;
+   const FORCE_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read> u_posBuf     : array<vec4f>;
+@group(0) @binding(1) var<storage, read> u_velBuf     : array<vec4f>;
+@group(0) @binding(2) var<storage, read> u_densityBuf : array<vec4f>;
+@group(0) @binding(3) var<storage, read> u_sortBuf    : array<vec4f>;
+@group(0) @binding(4) var<storage, read> u_gridBuf    : array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> u_velOutBuf : array<vec4f>;
 
-const TEXT_WIDTH   : i32 = ${STR_TEXT_WIDTH};
 const WORLD_MAX    : i32 = ${STR_WORLD_MAX};
-const GRID_W       : i32 = ${STR_GRID_WIDTH};
 const Z_MULT       : i32 = ${STR_Z_MULT};
 const WORLD_BOUND  : f32 = ${STR_WORLD_BOUND};
 
@@ -540,9 +487,7 @@ const REST_DENSITY : f32 = 5.0;
 const STIFFNESS    : f32 = 150.0;
 const VISCOSITY    : f32 = 1.5;
 const DT           : f32 = 0.005;
-// SPIKY_GRAD = -45 / (PI * H^6),  H^6 = 1.0
 const SPIKY_GRAD   : f32 = -45.0 / (3.14159265358979 * 1.0);
-// VISC_LAP   =  45 / (PI * H^6)
 const VISC_LAP     : f32 =  45.0 / (3.14159265358979 * 1.0);
 
 fn cellIndex(cell: vec3i) -> i32 {
@@ -550,13 +495,14 @@ fn cellIndex(cell: vec3i) -> i32 {
     return c.x + c.y * (WORLD_MAX + 1) + c.z * Z_MULT;
 }
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc        = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let myId      = pc.y * TEXT_WIDTH + pc.x;
-    let myPos     = textureLoad(u_posTex,     pc, 0).xyz;
-    let myVel     = textureLoad(u_velTex,     pc, 0).xyz;
-    let myDensity = textureLoad(u_densityTex, pc, 0).x;
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let id = global_id.x;
+    if (id >= u32(${STR_TOTAL_PARTICLES})) { return; }
+
+    let myPos     = u_posBuf[id].xyz;
+    let myVel     = u_velBuf[id].xyz;
+    let myDensity = u_densityBuf[id].x;
 
     let myPressure  = STIFFNESS * (myDensity - REST_DENSITY);
     var fPressure   = vec3f(0.0);
@@ -576,23 +522,20 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
             nc.z < 0 || nc.z > WORLD_MAX) { continue; }
 
         let ci       = cellIndex(nc);
-        let gridUV   = vec2i(ci % GRID_W, ci / GRID_W);
-        let gridData = textureLoad(u_gridTex, gridUV, 0);
+        let gridData = u_gridBuf[ci];
         let startIdx = i32(gridData.x);
         let count    = i32(gridData.y);
 
         if (count > 0) {
             for (var i = 0; i < count; i++) {
                 let si         = startIdx + i;
-                let sortUV     = vec2i(si % TEXT_WIDTH, si / TEXT_WIDTH);
-                let originalId = i32(textureLoad(u_sortTex, sortUV, 0).y);
+                let originalId = u32(u_sortBuf[si].y);
 
-                if (originalId == myId) { continue; } // skip self
+                if (originalId == id) { continue; } // skip self
 
-                let nUV      = vec2i(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
-                let nPos     = textureLoad(u_posTex,     nUV, 0).xyz;
-                let nVel     = textureLoad(u_velTex,     nUV, 0).xyz;
-                let nDensity = textureLoad(u_densityTex, nUV, 0).x;
+                let nPos     = u_posBuf[originalId].xyz;
+                let nVel     = u_velBuf[originalId].xyz;
+                let nDensity = u_densityBuf[originalId].x;
 
                 let diff = myPos - nPos;
                 let r    = length(diff);
@@ -601,59 +544,57 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
                     let dir       = diff / r;
                     let nPressure = STIFFNESS * (nDensity - REST_DENSITY);
 
-                    // Pressure force (identical formula to WebGL2)
                     let pTerm    = (myPressure + nPressure) / (2.0 * nDensity);
                     fPressure   += -dir * MASS * pTerm * SPIKY_GRAD * pow(H - r, 2.0);
 
-                    // Viscosity force
                     let vDiff    = nVel - myVel;
                     fViscosity  += VISCOSITY * MASS * (vDiff / nDensity) * VISC_LAP * (H - r);
                 }
             }
         }
-    }}}  // end 27-cell loops
+    }}} 
 
     let totalForce = fPressure + fViscosity + gravity;
     var newVel     = myVel + (totalForce / myDensity) * DT;
 
-    // Wall bounce (identical damping logic to WebGL2)
     let nextPos = myPos + newVel * DT;
     let damping : f32 = 0.5;
     if (nextPos.x < 0.0 || nextPos.x > WORLD_BOUND) { newVel.x *= -damping; }
     if (nextPos.y < 0.0 || nextPos.y > WORLD_BOUND) { newVel.y *= -damping; }
     if (nextPos.z < 0.0 || nextPos.z > WORLD_BOUND) { newVel.z *= -damping; }
 
-    return vec4f(newVel, 0.0);
+    u_velOutBuf[id] = vec4f(newVel, 0.0);
 }
 `;
 
     // -------------------------------------------------------------------------
     // 4.7  Integration pass  (Euler — mirrors integrateFsSource)
     // -------------------------------------------------------------------------
-    const INTEGRATE_FS = /* wgsl */`
-@group(0) @binding(0) var u_posTex : texture_2d<f32>;
-@group(0) @binding(1) var u_velTex : texture_2d<f32>;
+    const INTEGRATE_CS = /* wgsl */`
+@group(0) @binding(0) var<storage, read> u_posBuf : array<vec4f>;
+@group(0) @binding(1) var<storage, read> u_velBuf : array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> u_posOutBuf : array<vec4f>;
 
 const DT          : f32 = 0.005;
 const WORLD_BOUND : f32 = ${STR_WORLD_BOUND};
 
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pc      = vec2i(i32(fragCoord.x), i32(fragCoord.y));
-    let posData = textureLoad(u_posTex, pc, 0);
-    let myPos   = posData.xyz;
-    let pid     = posData.w; // preserve original ID in .w
+@compute @workgroup_size(${STR_WG_SIZE})
+fn cs_main(@builtin(global_invocation_id) global_id: vec3u) {
+    let id = global_id.x;
+    if (id >= u32(${STR_TOTAL_PARTICLES})) { return; }
 
-    let myVel = textureLoad(u_velTex, pc, 0).xyz;
+    let posData = u_posBuf[id];
+    let myPos   = posData.xyz;
+    let pid     = posData.w; 
+
+    let myVel = u_velBuf[id].xyz;
     var newPos = myPos + myVel * DT;
 
-    // Hard clamp (identical to WebGL2)
     newPos = clamp(newPos, vec3f(0.01), vec3f(WORLD_BOUND));
 
-    return vec4f(newPos, pid);
+    u_posOutBuf[id] = vec4f(newPos, pid);
 }
 `;
-
     // -------------------------------------------------------------------------
     // 4.8  Render vertex shader  (points — mirrors renderVsSource)
     //
@@ -667,22 +608,19 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     const RENDER_VS = /* wgsl */`
 struct RenderUniforms { aspect : f32 }
 
-@group(0) @binding(0) var<uniform>  u_uniforms : RenderUniforms;
-@group(0) @binding(1) var           u_posTex   : texture_2d<f32>;
+@group(0) @binding(0) var<uniform> u_uniforms : RenderUniforms;
+@group(0) @binding(1) var<storage, read> u_posBuf : array<vec4f>;
 
-const TEXT_WIDTH : i32 = ${STR_TEXT_WIDTH};
 const HALF_WORLD : f32 = ${STR_HALF_WORLD};
 
 struct VsOut {
     @builtin(position)  position  : vec4f,
-    @location(0)        depth     : f32,   //fixing some LLM hallucinations
+    @location(0)        depth     : f32,
 }
 
 @vertex
 fn vs_main(@builtin(vertex_index) vIdx: u32) -> VsOut {
-    let xi = i32(vIdx) % TEXT_WIDTH;
-    let yi = i32(vIdx) / TEXT_WIDTH;
-    let pos = textureLoad(u_posTex, vec2i(xi, yi), 0).xyz;
+    let pos = u_posBuf[vIdx].xyz;
 
     // 1. Centre the volume at origin  (identical to WebGL2)
     let cPos = pos - vec3f(HALF_WORLD);
@@ -747,42 +685,37 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
     // =========================================================================
 
     // Helper: BGL with N input textures + optional uniform buffer at last binding
-    function makeTexBGL(nTextures, hasUniform = false, uniformStage = GPUShaderStage.FRAGMENT) {
+    function makeComputeBGL(nReadBuffers, hasUniform = false) {
         const entries = [];
-        for (let i = 0; i < nTextures; i++) {
-            entries.push({
-                binding:    i,
-                visibility: GPUShaderStage.FRAGMENT,
-                texture:    { sampleType: 'unfilterable-float' },
-            });
-        }
+        let bindingIdx = 0;
+
         if (hasUniform) {
-            entries.push({
-                binding:    nTextures,
-                visibility: uniformStage,
-                buffer:     { type: 'uniform' },
-            });
+            entries.push({ binding: bindingIdx++, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } });
         }
+
+        // Input buffers (read-only)
+        for (let i = 0; i < nReadBuffers; i++) {
+            entries.push({ binding: bindingIdx++, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } });
+        }
+
+        // Output buffer (read-write)
+        entries.push({ binding: bindingIdx++, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } });
+        
         return device.createBindGroupLayout({ entries });
     }
 
-    const hashBGL     = makeTexBGL(1);                    // 1 tex
-    // Sort BGL: uniform first (binding 0), texture second (binding 1)
-    const sortBGL     = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer:  { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
-        ],
-    });
-    const scanBGL     = makeTexBGL(1);                    // 1 tex
-    const densityBGL  = makeTexBGL(3);                    // 3 tex
-    const forceBGL    = makeTexBGL(5);                    // 5 tex
-    const integrateBGL= makeTexBGL(2);                    // 2 tex
-    // Render BGL: uniform (binding 0, vertex stage), texture (binding 1, vertex stage)
+    const hashBGL      = makeComputeBGL(1);          // pos -> sortOut
+    const sortBGL      = makeComputeBGL(1, true);    // uniform, sortIn -> sortOut
+    const scanBGL      = makeComputeBGL(1);          // sortIn -> gridOut
+    const densityBGL   = makeComputeBGL(3);          // pos, sort, grid -> densityOut
+    const forceBGL     = makeComputeBGL(5);          // pos, vel, dens, sort, grid -> velOut
+    const integrateBGL = makeComputeBGL(2);          // pos, velNew -> posOut
+    
+    // Render pipeline now reads from a Storage Buffer in the Vertex Shader
     const renderBGL   = device.createBindGroupLayout({
         entries: [
-            { binding: 0, visibility: GPUShaderStage.VERTEX, buffer:  { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: 'unfilterable-float' } },
+            { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
         ],
     });
 
@@ -808,34 +741,23 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         return m;
     }
 
-    // Helper: build a GPGPU render pipeline targeting rgba32float
-    function makeGPGPUPipeline(label, vsCode, fsCode, bgl) {
-        const vsMod = makeShaderModule(label + '_vs', vsCode);
-        const fsMod = makeShaderModule(label + '_fs', fsCode);
-        return device.createRenderPipeline({
+    // Helper: Build a Native Compute Pipeline
+    function makeComputePipeline(label, code, bgl) {
+        const module = makeShaderModule(label, code);
+        return device.createComputePipeline({
             label,
-            layout:   device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-            vertex:   {
-                module:     vsMod,
-                entryPoint: 'vs_main',
-                buffers:    [QUAD_VBL],         // matches WebGL2's quadVAO binding
-            },
-            fragment: {
-                module:     fsMod,
-                entryPoint: 'fs_main',
-                targets:    [{ format: DATA_TEX_FORMAT }],
-            },
-            primitive: { topology: 'triangle-list' },
+            layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            compute: { module, entryPoint: 'cs_main' },
         });
     }
 
-    // GPGPU pipelines
-    const hashPipeline     = makeGPGPUPipeline('hash',     QUAD_VS, HASH_FS,     hashBGL);
-    const sortPipeline     = makeGPGPUPipeline('sort',     QUAD_VS, SORT_FS,     sortBGL);
-    const scanPipeline     = makeGPGPUPipeline('scan',     QUAD_VS, SCAN_FS,     scanBGL);
-    const densityPipeline  = makeGPGPUPipeline('density',  QUAD_VS, DENSITY_FS,  densityBGL);
-    const forcePipeline    = makeGPGPUPipeline('force',    QUAD_VS, FORCE_FS,    forceBGL);
-    const integratePipeline= makeGPGPUPipeline('integrate',QUAD_VS, INTEGRATE_FS,integrateBGL);
+    // Native Compute pipelines
+    const hashPipeline      = makeComputePipeline('hash',      HASH_CS,      hashBGL);
+    const sortPipeline      = makeComputePipeline('sort',      SORT_CS,      sortBGL);
+    const scanPipeline      = makeComputePipeline('scan',      SCAN_CS,      scanBGL);
+    const densityPipeline   = makeComputePipeline('density',   DENSITY_CS,   densityBGL);
+    const forcePipeline     = makeComputePipeline('force',     FORCE_CS,     forceBGL);
+    const integratePipeline = makeComputePipeline('integrate', INTEGRATE_CS, integrateBGL);
 
     // Render pipeline (particles as points, with depth test)
     const renderVsMod = makeShaderModule('render_vs', RENDER_VS);
@@ -867,75 +789,62 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
     //    just as WebGL2 sets uniforms per-frame with gl.uniform1i().
     // =========================================================================
 
-    function makeHashBG(posTex) {
-        return device.createBindGroup({
-            layout: hashBGL,
-            entries: [{ binding: 0, resource: posTex.createView() }],
-        });
+    function makeHashBG(posBuf, sortOutBuf) {
+        return device.createBindGroup({ layout: hashBGL, entries: [
+            { binding: 0, resource: { buffer: posBuf } },
+            { binding: 1, resource: { buffer: sortOutBuf } },
+        ]});
     }
 
-    // Sort BG: uniform buffer (binding 0), sort texture (binding 1)
-    function makeSortBG(uniformBuf, sortTex) {
-        return device.createBindGroup({
-            layout: sortBGL,
-            entries: [
-                { binding: 0, resource: { buffer: uniformBuf } },
-                { binding: 1, resource: sortTex.createView() },
-            ],
-        });
+    function makeSortBG(uniformBuf, sortInBuf, sortOutBuf) {
+        return device.createBindGroup({ layout: sortBGL, entries: [
+            { binding: 0, resource: { buffer: uniformBuf } },
+            { binding: 1, resource: { buffer: sortInBuf } },
+            { binding: 2, resource: { buffer: sortOutBuf } },
+        ]});
     }
 
-    function makeScanBG(sortTex) {
-        return device.createBindGroup({
-            layout: scanBGL,
-            entries: [{ binding: 0, resource: sortTex.createView() }],
-        });
+    function makeScanBG(sortInBuf, gridOutBuf) {
+        return device.createBindGroup({ layout: scanBGL, entries: [
+            { binding: 0, resource: { buffer: sortInBuf } },
+            { binding: 1, resource: { buffer: gridOutBuf } },
+        ]});
     }
 
-    function makeDensityBG(posTex, sortTex, grid) {
-        return device.createBindGroup({
-            layout: densityBGL,
-            entries: [
-                { binding: 0, resource: posTex.createView()  },
-                { binding: 1, resource: sortTex.createView() },
-                { binding: 2, resource: grid.createView()    },
-            ],
-        });
+    function makeDensityBG(posBuf, sortBuf, gridBuf, densityOutBuf) {
+        return device.createBindGroup({ layout: densityBGL, entries: [
+            { binding: 0, resource: { buffer: posBuf } },
+            { binding: 1, resource: { buffer: sortBuf } },
+            { binding: 2, resource: { buffer: gridBuf } },
+            { binding: 3, resource: { buffer: densityOutBuf } },
+        ]});
     }
 
-    function makeForceBG(posTex, velTex, densTex, sortTex, grid) {
-        return device.createBindGroup({
-            layout: forceBGL,
-            entries: [
-                { binding: 0, resource: posTex.createView()  },
-                { binding: 1, resource: velTex.createView()  },
-                { binding: 2, resource: densTex.createView() },
-                { binding: 3, resource: sortTex.createView() },
-                { binding: 4, resource: grid.createView()    },
-            ],
-        });
+    function makeForceBG(posBuf, velBuf, densBuf, sortBuf, gridBuf, velOutBuf) {
+        return device.createBindGroup({ layout: forceBGL, entries: [
+            { binding: 0, resource: { buffer: posBuf } },
+            { binding: 1, resource: { buffer: velBuf } },
+            { binding: 2, resource: { buffer: densBuf } },
+            { binding: 3, resource: { buffer: sortBuf } },
+            { binding: 4, resource: { buffer: gridBuf } },
+            { binding: 5, resource: { buffer: velOutBuf } },
+        ]});
     }
 
-    function makeIntegrateBG(posTex, velTex) {
-        return device.createBindGroup({
-            layout: integrateBGL,
-            entries: [
-                { binding: 0, resource: posTex.createView() },
-                { binding: 1, resource: velTex.createView() },
-            ],
-        });
+    function makeIntegrateBG(posBuf, velBuf, posOutBuf) {
+        return device.createBindGroup({ layout: integrateBGL, entries: [
+            { binding: 0, resource: { buffer: posBuf } },
+            { binding: 1, resource: { buffer: velBuf } },
+            { binding: 2, resource: { buffer: posOutBuf } },
+        ]});
     }
 
-    function makeRenderBG(posTex) {
-        return device.createBindGroup({
-            layout: renderBGL,
-            entries: [
-                { binding: 0, resource: { buffer: aspectUniformBuf } },
-                { binding: 1, resource: posTex.createView()          },
-            ],
-        });
+    function makeRenderBG(posBuf) {
+        return device.createBindGroup({ layout: renderBGL, entries: [
+            { binding: 0, resource: { buffer: aspectUniformBuf } },
+            { binding: 1, resource: { buffer: posBuf } },
+        ]});
     }
-
     // =========================================================================
     // 8. CORE SIMULATION STEP
     //    Mirrors WebGL2's stepSimulation() exactly in pass order and data flow.
@@ -945,97 +854,54 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
     // =========================================================================
     function stepSimulation() {
         const enc = device.createCommandEncoder({ label: 'sim-step' });
+        const cp = enc.beginComputePass(); // One compute pass for all physics!
 
-        // Inner helper: run one GPGPU render pass to an rgba32float texture target.
-        // Mirrors WebGL2's pattern of:
-        //   gl.bindFramebuffer(FBO) → gl.viewport() → gl.useProgram() → gl.drawArrays()
-        function gpuPass(pipeline, bindGroup, outTex, w, h) { //FIX: turns out webgpu is stricter than webgl2 when it comes to overwriting pixels. will need to clear first.
-            const rp = enc.beginRenderPass({
-                colorAttachments: [{
-                    view:       outTex.createView(),
-                    clearValue: [0.0, 0.0, 0.0, 0.0],
-                    loadOp:     'clear', 
-                    storeOp:    'store',
-                }],
-            });
-            rp.setPipeline(pipeline);
-            rp.setBindGroup(0, bindGroup);
-            rp.setVertexBuffer(0, quadVertexBuffer); // mirrors gl.bindVertexArray(quadVAO)
-            rp.setViewport(0, 0, w, h, 0, 1);        // mirrors gl.viewport(0,0,w,h)
-            rp.draw(6);                               // mirrors gl.drawArrays(TRIANGLES,0,6)
-            rp.end();
+        function dispatchPass(pipeline, bindGroup, threadCount) {
+            cp.setPipeline(pipeline);
+            cp.setBindGroup(0, bindGroup);
+            // Dispatch enough workgroups of size 64 to cover all items
+            cp.dispatchWorkgroups(Math.ceil(threadCount / WORKGROUP_SIZE));
         }
 
-        // ------------------------------------------------------------------
-        // PASS 1: Spatial Hashing
-        //   Input:  readState.posTex
-        //   Output: sortTexA  (always starts hash result in A)
-        // ------------------------------------------------------------------
-        gpuPass(hashPipeline, makeHashBG(readState.posTex),
-                sortTexA, TEXT_WIDTH, TEXT_HEIGHT);
+        // 1. Hash
+        dispatchPass(hashPipeline, makeHashBG(readState.posBuf, sortBufA), PARTICLE_COUNT);
 
-        // ------------------------------------------------------------------
-        // PASS 2: Bitonic Sort  (N log²N / 2 render passes)
-        //   Ping-pongs between sortTexA and sortTexB, consuming one
-        //   pre-built uniform buffer per iteration.
-        // ------------------------------------------------------------------
-        let sortReadTex  = sortTexA;
-        let sortWriteTex = sortTexB;
-
+        // 2. Sort
+        let sortReadBuf  = sortBufA;
+        let sortWriteBuf = sortBufB;
         for (let iter = 0; iter < sortIterations.length; iter++) {
-            gpuPass(sortPipeline,
-                    makeSortBG(sortUniformBuffers[iter], sortReadTex),
-                    sortWriteTex, TEXT_WIDTH, TEXT_HEIGHT);
-            // Swap sort ping-pong (mirrors WebGL2's local currentSortRead/Write swap)
-            const tmp    = sortReadTex;
-            sortReadTex  = sortWriteTex;
-            sortWriteTex = tmp;
+            dispatchPass(sortPipeline, 
+                         makeSortBG(sortUniformBuffers[iter], sortReadBuf, sortWriteBuf), 
+                         PARTICLE_COUNT);
+            const tmp    = sortReadBuf;
+            sortReadBuf  = sortWriteBuf;
+            sortWriteBuf = tmp;
         }
-        // sortReadTex now holds the fully sorted array (same as WebGL2's currentSortReadTex)
 
-        // ------------------------------------------------------------------
-        // PASS 3: Grid Scanner
-        //   Input:  sortReadTex (sorted particle array)
-        //   Output: gridTex
-        // ------------------------------------------------------------------
-        gpuPass(scanPipeline, makeScanBG(sortReadTex),
-                gridTex, GRID_WIDTH, GRID_HEIGHT);
+        // 3. Scan Grid (Dispatches over total grid cells, NOT particle count!)
+        const totalCells = GRID_WIDTH * GRID_HEIGHT;
+        dispatchPass(scanPipeline, makeScanBG(sortReadBuf, gridBuf), totalCells);
 
-        // ------------------------------------------------------------------
-        // PASS 4: Density Calculation
-        //   Inputs:  readState.posTex, sortReadTex, gridTex
-        //   Output:  densityTex
-        // ------------------------------------------------------------------
-        gpuPass(densityPipeline,
-                makeDensityBG(readState.posTex, sortReadTex, gridTex),
-                densityTex, TEXT_WIDTH, TEXT_HEIGHT);
+        // 4. Density
+        dispatchPass(densityPipeline, 
+                     makeDensityBG(readState.posBuf, sortReadBuf, gridBuf, densityBuf), 
+                     PARTICLE_COUNT);
 
-        // ------------------------------------------------------------------
-        // PASS 5: Force Calculation
-        //   Inputs:  readState.posTex, readState.velTex, densityTex, sortReadTex, gridTex
-        //   Output:  writeState.velTex  (new velocities)
-        // ------------------------------------------------------------------
-        gpuPass(forcePipeline,
-                makeForceBG(readState.posTex, readState.velTex,
-                            densityTex, sortReadTex, gridTex),
-                writeState.velTex, TEXT_WIDTH, TEXT_HEIGHT);
+        // 5. Force
+        dispatchPass(forcePipeline, 
+                     makeForceBG(readState.posBuf, readState.velBuf, densityBuf, sortReadBuf, gridBuf, writeState.velBuf), 
+                     PARTICLE_COUNT);
 
-        // ------------------------------------------------------------------
-        // PASS 6: Integration
-        //   Inputs:  readState.posTex, writeState.velTex  (just-written velocities!)
-        //   Output:  writeState.posTex
-        // ------------------------------------------------------------------
-        gpuPass(integratePipeline,
-                makeIntegrateBG(readState.posTex, writeState.velTex),
-                writeState.posTex, TEXT_WIDTH, TEXT_HEIGHT);
+        // 6. Integrate
+        dispatchPass(integratePipeline, 
+                     makeIntegrateBG(readState.posBuf, writeState.velBuf, writeState.posBuf), 
+                     PARTICLE_COUNT);
 
-        // Submit the entire step as one command buffer
+        cp.end();
         device.queue.submit([enc.finish()]);
 
-        // Swap ping-pong state (mirrors WebGL2's swapPingPong())
         swapPingPong();
     }
-
     // =========================================================================
     // 9. RENDER LOOP  (mirrors WebGL2's renderLoop)
     // =========================================================================
@@ -1072,9 +938,7 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         });
 
         rp.setPipeline(renderPipeline);
-        rp.setBindGroup(0, makeRenderBG(readState.posTex));
-        // NO vertex buffer — vertex shader uses @builtin(vertex_index) to index the texture
-        // mirrors: gl.bindVertexArray(null); gl.drawArrays(POINTS, 0, PARTICLE_COUNT)
+        rp.setBindGroup(0, makeRenderBG(readState.posBuf));
         rp.draw(PARTICLE_COUNT);
         rp.end();
 
@@ -1092,15 +956,10 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
     // =========================================================================
     async function forceGpuSync() {
         const enc = device.createCommandEncoder({ label: 'sync-fence' });
-        // Copy exactly 1 pixel from the position texture (4 × float32 = 16 bytes)
-        // bytesPerRow must be ≥ 256 per WebGPU spec, hence the 256-byte syncBuffer
-        enc.copyTextureToBuffer(
-            { texture: readState.posTex, origin: [0, 0, 0] },
-            { buffer: syncBuffer, bytesPerRow: 256 },
-            [1, 1, 1]
-        );
+        // Copy 16 bytes (one particle position / vec4f) to the sync buffer
+        enc.copyBufferToBuffer(readState.posBuf, 0, syncBuffer, 0, 16);
         device.queue.submit([enc.finish()]);
-        // mapAsync creates the same CPU stall as WebGL2's synchronous readPixels
+        
         await syncBuffer.mapAsync(GPUMapMode.READ);
         syncBuffer.unmap();
     }
