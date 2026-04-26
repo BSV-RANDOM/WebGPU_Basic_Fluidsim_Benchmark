@@ -1,0 +1,1213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGPU SPH Fluid Benchmark</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #eee; font-family: sans-serif; }
+        #ui { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; }
+        button { padding: 10px 15px; margin-right: 10px; cursor: pointer; background: #333; color: white; border: 1px solid #555; border-radius: 4px;}
+        button:hover { background: #444; }
+        #stats { margin-top: 15px; font-family: monospace; white-space: pre; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<div id="ui">
+    <label for="steps-input" style="margin-right: 5px; font-size: 14px;">Steps/Frame:</label>
+    <input type="number" id="steps-input" value="5" min="1" max="50"
+        style="margin-right: 15px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; padding: 8px 5px; width: 50px;">
+    <button id="btn-low">Low Mode (16k)</button>
+    <button id="btn-high">High Mode (65k)</button>
+    <button id="btn-low-small">Low Reduced Size (16k, 16^3)</button>
+    <button id="btn-render">Start Render Mode</button>
+    <button id="btn-headless">Start Headless Benchmark</button>
+    <div id="stats">Awaiting start...</div>
+</div>
+<canvas id="glcanvas"></canvas>
+
+<script>
+// =============================================================================
+// 1. TOP-LEVEL SETUP  (mirrors WebGL2 version structure exactly)
+// =============================================================================
+const canvas  = document.getElementById('glcanvas');
+canvas.width  = window.innerWidth;
+canvas.height = window.innerHeight;
+const statsDiv = document.getElementById('stats');
+
+// Deferred: device/context are created inside buildPipelineAndStart()
+// to match the WebGL2 pattern where WebGL is init'd lazily.
+let device       = null;
+let gpuContext   = null;
+let canvasFormat = null;
+
+let isPipelineBuilt = false;
+let simMode         = 'low'; // 'low' | 'high' | 'low_small'
+
+// Full-screen quad vertex positions (identical layout to WebGL2's quadVBO)
+const QUAD_VERTS = new Float32Array([
+    -1.0, -1.0,
+     1.0, -1.0,
+    -1.0,  1.0,
+    -1.0,  1.0,
+     1.0, -1.0,
+     1.0,  1.0
+]);
+
+// =============================================================================
+// 2. WEBGPU DEVICE INITIALISATION
+// =============================================================================
+async function initWebGPU() {
+    if (!navigator.gpu) {
+        alert('WebGPU is not supported by your browser.');
+        throw new Error('WebGPU required');
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        alert('No WebGPU adapter found.');
+        throw new Error('WebGPU adapter required');
+    }
+
+    // Request float32-filterable if available.  We only use textureLoad
+    // (no sampler) so this is not strictly required, but it signals to the
+    // driver that we intend to work with 32-bit float render targets.
+    const wantedFeatures = [];
+    if (adapter.features.has('float32-filterable')) {
+        wantedFeatures.push('float32-filterable');
+    }
+
+    device = await adapter.requestDevice({ requiredFeatures: wantedFeatures });
+
+    device.addEventListener('uncapturederror', ev => {
+        console.error('WebGPU uncaptured error:', ev.error);
+    });
+
+    canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    gpuContext   = canvas.getContext('webgpu');
+    gpuContext.configure({ device, format: canvasFormat, alphaMode: 'premultiplied' });
+}
+
+// =============================================================================
+// 3. MAIN PIPELINE + SIMULATION BUILDER
+//    Called once when the user presses a start button, exactly as in WebGL2.
+// =============================================================================
+async function buildPipelineAndStart(isRenderMode) {
+    if (isPipelineBuilt) return;
+    isPipelineBuilt = true;
+
+    await initWebGPU();
+
+    // -------------------------------------------------------------------------
+    // 3.1  Simulation constants  (mirrors WebGL2's const block)
+    // -------------------------------------------------------------------------
+    const IS_HIGH_MODE  = simMode === 'high';
+    const IS_SMALL_WORLD = simMode === 'low_small';
+
+    const TEXT_WIDTH     = IS_HIGH_MODE  ? 256 : 128;
+    const TEXT_HEIGHT    = IS_HIGH_MODE  ? 256 : 128;
+    const PARTICLE_COUNT = TEXT_WIDTH * TEXT_HEIGHT;
+
+    const WORLD_SIZE  = IS_SMALL_WORLD ? 16  : 32;
+    const WORLD_MAX   = WORLD_SIZE - 1;
+    const WORLD_BOUND = WORLD_SIZE - 0.01;
+
+    const GRID_WIDTH  = IS_SMALL_WORLD ? 64  : 256;
+    const GRID_HEIGHT = IS_SMALL_WORLD ? 64  : 128;
+
+    // String-injected shader constants (identical to WebGL2 pattern)
+    const STR_TEXT_WIDTH      = TEXT_WIDTH.toString();
+    const STR_TOTAL_PARTICLES = PARTICLE_COUNT.toString();
+    // Binary search needs ceil(log2(N)) iterations; +1 for safety margin
+    const STR_SCAN_STEPS      = (Math.ceil(Math.log2(PARTICLE_COUNT)) + 1).toString();
+    const STR_WORLD_SIZE      = WORLD_SIZE.toFixed(1);
+    const STR_WORLD_MAX       = WORLD_MAX.toString();
+    const STR_WORLD_BOUND     = WORLD_BOUND.toFixed(2);
+    const STR_GRID_WIDTH      = GRID_WIDTH.toString();
+    const STR_Z_MULT          = (WORLD_SIZE * WORLD_SIZE).toString();
+    const STR_HALF_WORLD      = (WORLD_SIZE / 2.0).toFixed(1);
+
+    // -------------------------------------------------------------------------
+    // 3.2  Vertex buffer for the full-screen quad
+    //      Mirrors WebGL2's quadVBO / quadVAO approach.
+    //      The quad VS uses @location(0) just like WebGL2's layout(location=0).
+    // -------------------------------------------------------------------------
+    const quadVertexBuffer = device.createBuffer({
+        label: 'quad-vbo',
+        size:  QUAD_VERTS.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(quadVertexBuffer, 0, QUAD_VERTS);
+
+    // Vertex buffer layout descriptor – two float32 components, no stride padding
+    const QUAD_VBL = {
+        arrayStride: 8,
+        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+    };
+
+    // -------------------------------------------------------------------------
+    // 3.3  Texture helpers  (mirrors WebGL2's createDataTexture / createFBO)
+    // -------------------------------------------------------------------------
+    const DATA_TEX_FORMAT = 'rgba32float'; // same as WebGL2's RGBA32F
+
+    function createDataTexture(width, height, initData /*Float32Array|null*/) {
+        const tex = device.createTexture({
+            size:   [width, height, 1],
+            format: DATA_TEX_FORMAT,
+            // TEXTURE_BINDING = sampler/textureLoad read
+            // RENDER_ATTACHMENT = write via render pass (replaces FBO)
+            // COPY_SRC / COPY_DST for the sync-barrier readback trick
+            usage:  GPUTextureUsage.TEXTURE_BINDING  |
+                    GPUTextureUsage.RENDER_ATTACHMENT |
+                    GPUTextureUsage.COPY_SRC          |
+                    GPUTextureUsage.COPY_DST,
+        });
+        if (initData) {
+            device.queue.writeTexture(
+                { texture: tex },
+                initData,
+                { bytesPerRow: width * 4 * 4 },   // 4 channels × 4 bytes
+                [width, height, 1]
+            );
+        }
+        return tex;
+    }
+
+    // In WebGPU there is no separate FBO object; the texture IS the render target.
+    // We simply reference the texture directly in the render pass descriptor.
+    // No createFBO() helper is needed.
+
+    // -------------------------------------------------------------------------
+    // 3.4  Particle data init  (identical math to WebGL2)
+    // -------------------------------------------------------------------------
+    const initialPositions  = new Float32Array(PARTICLE_COUNT * 4);
+    const initialVelocities = new Float32Array(PARTICLE_COUNT * 4); // all zeros
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        // Dam-break scenario: left half of volume
+        initialPositions[i * 4 + 0] = Math.random() * (WORLD_SIZE / 2.0);
+        initialPositions[i * 4 + 1] = Math.random() * WORLD_SIZE;
+        initialPositions[i * 4 + 2] = Math.random() * WORLD_SIZE;
+        initialPositions[i * 4 + 3] = i; // original index stored in w
+    }
+
+    // -------------------------------------------------------------------------
+    // 3.5  Ping-pong textures  (replaces posTexA/B, velTexA/B + their FBOs)
+    // -------------------------------------------------------------------------
+    const posTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialPositions);
+    const posTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+    const velTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialVelocities);
+    const velTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+
+    // Sort ping-pong buffers
+    const initialSortData = new Float32Array(PARTICLE_COUNT * 4);
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        initialSortData[i * 4 + 1] = i; // particle ID in .y, cell index .x = 0
+    }
+    const sortTexA = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, initialSortData);
+    const sortTexB = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+
+    // Grid lookup texture (one cell per texel)
+    const gridTex    = createDataTexture(GRID_WIDTH,  GRID_HEIGHT,  null);
+    // Density texture
+    const densityTex = createDataTexture(TEXT_WIDTH, TEXT_HEIGHT, null);
+
+    // State tracking – exactly mirrors WebGL2's readState / writeState objects
+    let readState  = { posTex: posTexA, velTex: velTexA };
+    let writeState = { posTex: posTexB, velTex: velTexB };
+
+    function swapPingPong() {
+        const prev = readState;
+        readState  = { posTex: writeState.posTex, velTex: writeState.velTex };
+        writeState = { posTex: prev.posTex,        velTex: prev.velTex        };
+    }
+
+    // -------------------------------------------------------------------------
+    // 3.6  Sort iteration pre-computation  (bitonic sort parameters)
+    //      Pre-build all (k, j) uniform buffers so every iteration has a unique
+    //      buffer – this replaces WebGL2's per-draw gl.uniform1i(k) / gl.uniform1i(j).
+    // -------------------------------------------------------------------------
+    const sortIterations = [];
+    for (let k = 2; k <= PARTICLE_COUNT; k <<= 1) {
+        for (let j = k >> 1; j > 0; j >>= 1) {
+            sortIterations.push({ k, j });
+        }
+    }
+
+    // One tiny uniform buffer per (k,j) pair, written once at startup.
+    // 16 bytes = minimum uniform buffer size in WebGPU.
+    const sortUniformBuffers = sortIterations.map(({ k, j }) => {
+        const buf = device.createBuffer({
+            size:  16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(buf, 0, new Int32Array([k, j, 0, 0]));
+        return buf;
+    });
+
+    // Aspect-ratio uniform for the render pass (updated each frame)
+    const aspectUniformBuf = device.createBuffer({
+        label: 'aspect-uniform',
+        size:  16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(aspectUniformBuf, 0,
+        new Float32Array([canvas.width / canvas.height, 0, 0, 0]));
+
+    // Sync buffer for GPU fence (mirrors WebGL2's forceGpuSync readPixels trick).
+    // bytesPerRow must be ≥ 256 in WebGPU for copyTextureToBuffer.
+    const syncBuffer = device.createBuffer({
+        label: 'sync-buf',
+        size:  256,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    // Depth texture for the render pass (mirrors gl.clear(DEPTH_BUFFER_BIT))
+    const depthTexture = device.createTexture({
+        label: 'depth',
+        size:  [canvas.width, canvas.height, 1],
+        format: 'depth24plus',
+        usage:  GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+
+    // =========================================================================
+    // 4. WGSL SHADER SOURCES
+    //    Pattern: same string-injection approach as the WebGL2 GLSL sources.
+    //    texture() + gl_FragCoord → textureLoad() + @builtin(position)
+    //    texelFetch()             → textureLoad()
+    //    gl_FragCoord.xy          → floor(fragCoord.xy) cast to vec2i
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // 4.1  Shared quad vertex shader
+    //      Mirrors WebGL2's quadVertexShaderSource exactly.
+    //      Uses @location(0) to match the vertex buffer layout above.
+    // -------------------------------------------------------------------------
+    const QUAD_VS = /* wgsl */`
+struct VsOut {
+    @builtin(position) position : vec4f,
+    @location(0)       texCoord : vec2f,
+}
+@vertex
+fn vs_main(@location(0) a_position: vec2f) -> VsOut {
+    var o: VsOut;
+    o.position = vec4f(a_position, 0.0, 1.0);
+    // Identical UV calculation to WebGL2: v_texCoord = a_position * 0.5 + 0.5
+    o.texCoord = a_position * 0.5 + 0.5;
+    return o;
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.2  Hash pass  (spatial hashing — mirrors hashFsSource)
+    //      Reads position texture, outputs (cellIndex, particleId, 0, 0)
+    // -------------------------------------------------------------------------
+    const HASH_FS = /* wgsl */`
+@group(0) @binding(0) var u_posTex : texture_2d<f32>;
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc      = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let posData = textureLoad(u_posTex, pc, 0);
+    let pos        = posData.xyz;
+    let particleId = posData.w;
+
+    // Defensive clamp identical to WebGL2's DEFENSIVE DEBUGGING block
+    let clampedPos = clamp(pos, vec3f(0.0), vec3f(${STR_WORLD_BOUND}));
+    let cell3D     = floor(clampedPos);
+    let cellIndex  = cell3D.x
+                   + cell3D.y * ${STR_WORLD_SIZE}
+                   + cell3D.z * f32(${STR_Z_MULT});
+
+    // R = cellIndex (sort key), G = particleId (payload)
+    return vec4f(cellIndex, particleId, 0.0, 0.0);
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.3  Bitonic sort pass  (mirrors sortFsSource)
+    //      k and j come from a uniform buffer (one per iteration).
+    // -------------------------------------------------------------------------
+    const SORT_FS = /* wgsl */`
+struct SortParams {
+    k : i32,
+    j : i32,
+}
+@group(0) @binding(0) var<uniform>  params   : SortParams;
+@group(0) @binding(1) var           u_sortTex: texture_2d<f32>;
+
+const TEXT_WIDTH : i32 = ${STR_TEXT_WIDTH};
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc        = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let id        = pc.y * TEXT_WIDTH + pc.x;
+    let partnerId = id ^ params.j;
+
+    let partnerCoord = vec2i(partnerId % TEXT_WIDTH, partnerId / TEXT_WIDTH);
+
+    let myData      = textureLoad(u_sortTex, pc,          0);
+    let partnerData = textureLoad(u_sortTex, partnerCoord, 0);
+
+    let myKey      = myData.x;
+    let partnerKey = partnerData.x;
+
+    // (id & k) == 0  means ascending block  (identical to WebGL2)
+    let ascending = (id & params.k) == 0;
+    var result    = myData;
+
+    if (partnerId > id) {
+        // Left element: swap if wrong order for our direction
+        // WGSL select(falseVal, trueVal, cond) ≡ cond ? trueVal : falseVal
+        if (select(myKey < partnerKey, myKey > partnerKey, ascending)) {
+            result = partnerData;
+        }
+    } else {
+        // Right element
+        if (select(myKey > partnerKey, myKey < partnerKey, ascending)) {
+            result = partnerData;
+        }
+    }
+    return result;
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.4  Grid scanner pass  (binary search — mirrors scanFsSource)
+    // -------------------------------------------------------------------------
+    const SCAN_FS = /* wgsl */`
+@group(0) @binding(0) var u_sortTex : texture_2d<f32>;
+
+const TEXT_WIDTH      : i32 = ${STR_TEXT_WIDTH};
+const TOTAL_PARTICLES : i32 = ${STR_TOTAL_PARTICLES};
+const GRID_W          : i32 = ${STR_GRID_WIDTH};
+const SCAN_STEPS      : i32 = ${STR_SCAN_STEPS};
+
+fn getCellAt(index: i32) -> i32 {
+    let uv = vec2i(index % TEXT_WIDTH, index / TEXT_WIDTH);
+    return i32(textureLoad(u_sortTex, uv, 0).x);
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc         = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let targetCell = pc.y * GRID_W + pc.x;
+
+    // ---- Binary search for FIRST occurrence ----
+    var low        = 0;
+    var high       = TOTAL_PARTICLES - 1;
+    var firstIndex = -1;
+
+    for (var i = 0; i < SCAN_STEPS; i++) {
+        if (low > high) { break; }
+        let mid     = (low + high) / 2;
+        let midCell = getCellAt(mid);
+        if (midCell == targetCell) {
+            firstIndex = mid;
+            high       = mid - 1;
+        } else if (midCell < targetCell) {
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    var count    = 0.0;
+    var startIdx = -1.0;
+
+    if (firstIndex != -1) {
+        startIdx = f32(firstIndex);
+
+        // ---- Binary search for LAST occurrence ----
+        var lo        = firstIndex;
+        var hi        = TOTAL_PARTICLES - 1;
+        var lastIndex = firstIndex;
+
+        for (var i = 0; i < SCAN_STEPS; i++) {
+            if (lo > hi) { break; }
+            let mid     = (lo + hi) / 2;
+            let midCell = getCellAt(mid);
+            if (midCell == targetCell) {
+                lastIndex = mid;
+                lo        = mid + 1;
+            } else if (midCell < targetCell) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        count = f32(lastIndex - firstIndex + 1);
+    }
+
+    // R = startIndex, G = count  (mirrors WebGL2 outColor)
+    return vec4f(startIdx, count, 0.0, 0.0);
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.5  Density pass  (27-cell neighbour search — mirrors densityFsSource)
+    //      H=1.0 so H9=1.0; POLY6 computed at compile time.
+    // -------------------------------------------------------------------------
+    const DENSITY_FS = /* wgsl */`
+@group(0) @binding(0) var u_posTex  : texture_2d<f32>;
+@group(0) @binding(1) var u_sortTex : texture_2d<f32>;
+@group(0) @binding(2) var u_gridTex : texture_2d<f32>;
+
+const TEXT_WIDTH  : i32 = ${STR_TEXT_WIDTH};
+const WORLD_MAX   : i32 = ${STR_WORLD_MAX};
+const GRID_W      : i32 = ${STR_GRID_WIDTH};
+const Z_MULT      : i32 = ${STR_Z_MULT};
+
+const H    : f32 = 1.0;
+const MASS : f32 = 1.0;
+const H2   : f32 = 1.0;  // H*H  = 1.0
+// POLY6 = 315 / (64 * PI * H^9),  H^9 = 1.0
+const POLY6 : f32 = 315.0 / (64.0 * 3.14159265358979 * 1.0);
+
+fn cellIndex(cell: vec3i) -> i32 {
+    let c = clamp(cell, vec3i(0), vec3i(WORLD_MAX));
+    return c.x + c.y * (WORLD_MAX + 1) + c.z * Z_MULT;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc    = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let myPos = textureLoad(u_posTex, pc, 0).xyz;
+    let myCell = vec3i(i32(floor(myPos.x)),
+                       i32(floor(myPos.y)),
+                       i32(floor(myPos.z)));
+    var myDensity = 0.0;
+
+    for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+        let nc = myCell + vec3i(dx, dy, dz);
+        if (nc.x < 0 || nc.x > WORLD_MAX ||
+            nc.y < 0 || nc.y > WORLD_MAX ||
+            nc.z < 0 || nc.z > WORLD_MAX) { continue; }
+
+        let ci       = cellIndex(nc);
+        let gridUV   = vec2i(ci % GRID_W, ci / GRID_W);
+        let gridData = textureLoad(u_gridTex, gridUV, 0);
+        let startIdx = i32(gridData.x);
+        let count    = i32(gridData.y);
+
+        if (count > 0) {
+            for (var i = 0; i < count; i++) {
+                let si         = startIdx + i;
+                let sortUV     = vec2i(si % TEXT_WIDTH, si / TEXT_WIDTH);
+                let originalId = i32(textureLoad(u_sortTex, sortUV, 0).y);
+                let nUV        = vec2i(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
+                let nPos       = textureLoad(u_posTex, nUV, 0).xyz;
+
+                let diff = myPos - nPos;
+                let r2   = dot(diff, diff);
+                if (r2 < H2) {
+                    let w = H2 - r2;
+                    myDensity += MASS * POLY6 * w * w * w;
+                }
+            }
+        }
+    }}}  // end 27-cell loops
+
+    myDensity = max(myDensity, 0.0001);
+    return vec4f(myDensity, 0.0, 0.0, 0.0);
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.6  Force pass  (pressure + viscosity — mirrors forceFsSource)
+    // -------------------------------------------------------------------------
+    const FORCE_FS = /* wgsl */`
+@group(0) @binding(0) var u_posTex     : texture_2d<f32>;
+@group(0) @binding(1) var u_velTex     : texture_2d<f32>;
+@group(0) @binding(2) var u_densityTex : texture_2d<f32>;
+@group(0) @binding(3) var u_sortTex    : texture_2d<f32>;
+@group(0) @binding(4) var u_gridTex    : texture_2d<f32>;
+
+const TEXT_WIDTH   : i32 = ${STR_TEXT_WIDTH};
+const WORLD_MAX    : i32 = ${STR_WORLD_MAX};
+const GRID_W       : i32 = ${STR_GRID_WIDTH};
+const Z_MULT       : i32 = ${STR_Z_MULT};
+const WORLD_BOUND  : f32 = ${STR_WORLD_BOUND};
+
+const H            : f32 = 1.0;
+const MASS         : f32 = 1.0;
+const REST_DENSITY : f32 = 5.0;
+const STIFFNESS    : f32 = 150.0;
+const VISCOSITY    : f32 = 1.5;
+const DT           : f32 = 0.005;
+// SPIKY_GRAD = -45 / (PI * H^6),  H^6 = 1.0
+const SPIKY_GRAD   : f32 = -45.0 / (3.14159265358979 * 1.0);
+// VISC_LAP   =  45 / (PI * H^6)
+const VISC_LAP     : f32 =  45.0 / (3.14159265358979 * 1.0);
+
+fn cellIndex(cell: vec3i) -> i32 {
+    let c = clamp(cell, vec3i(0), vec3i(WORLD_MAX));
+    return c.x + c.y * (WORLD_MAX + 1) + c.z * Z_MULT;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc        = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let myId      = pc.y * TEXT_WIDTH + pc.x;
+    let myPos     = textureLoad(u_posTex,     pc, 0).xyz;
+    let myVel     = textureLoad(u_velTex,     pc, 0).xyz;
+    let myDensity = textureLoad(u_densityTex, pc, 0).x;
+
+    let myPressure  = STIFFNESS * (myDensity - REST_DENSITY);
+    var fPressure   = vec3f(0.0);
+    var fViscosity  = vec3f(0.0);
+    let gravity     = vec3f(0.0, -9.8, 0.0);
+
+    let myCell = vec3i(i32(floor(myPos.x)),
+                       i32(floor(myPos.y)),
+                       i32(floor(myPos.z)));
+
+    for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+        let nc = myCell + vec3i(dx, dy, dz);
+        if (nc.x < 0 || nc.x > WORLD_MAX ||
+            nc.y < 0 || nc.y > WORLD_MAX ||
+            nc.z < 0 || nc.z > WORLD_MAX) { continue; }
+
+        let ci       = cellIndex(nc);
+        let gridUV   = vec2i(ci % GRID_W, ci / GRID_W);
+        let gridData = textureLoad(u_gridTex, gridUV, 0);
+        let startIdx = i32(gridData.x);
+        let count    = i32(gridData.y);
+
+        if (count > 0) {
+            for (var i = 0; i < count; i++) {
+                let si         = startIdx + i;
+                let sortUV     = vec2i(si % TEXT_WIDTH, si / TEXT_WIDTH);
+                let originalId = i32(textureLoad(u_sortTex, sortUV, 0).y);
+
+                if (originalId == myId) { continue; } // skip self
+
+                let nUV      = vec2i(originalId % TEXT_WIDTH, originalId / TEXT_WIDTH);
+                let nPos     = textureLoad(u_posTex,     nUV, 0).xyz;
+                let nVel     = textureLoad(u_velTex,     nUV, 0).xyz;
+                let nDensity = textureLoad(u_densityTex, nUV, 0).x;
+
+                let diff = myPos - nPos;
+                let r    = length(diff);
+
+                if (r > 0.0 && r < H) {
+                    let dir       = diff / r;
+                    let nPressure = STIFFNESS * (nDensity - REST_DENSITY);
+
+                    // Pressure force (identical formula to WebGL2)
+                    let pTerm    = (myPressure + nPressure) / (2.0 * nDensity);
+                    fPressure   += -dir * MASS * pTerm * SPIKY_GRAD * pow(H - r, 2.0);
+
+                    // Viscosity force
+                    let vDiff    = nVel - myVel;
+                    fViscosity  += VISCOSITY * MASS * (vDiff / nDensity) * VISC_LAP * (H - r);
+                }
+            }
+        }
+    }}}  // end 27-cell loops
+
+    let totalForce = fPressure + fViscosity + gravity;
+    var newVel     = myVel + (totalForce / myDensity) * DT;
+
+    // Wall bounce (identical damping logic to WebGL2)
+    let nextPos = myPos + newVel * DT;
+    let damping : f32 = 0.5;
+    if (nextPos.x < 0.0 || nextPos.x > WORLD_BOUND) { newVel.x *= -damping; }
+    if (nextPos.y < 0.0 || nextPos.y > WORLD_BOUND) { newVel.y *= -damping; }
+    if (nextPos.z < 0.0 || nextPos.z > WORLD_BOUND) { newVel.z *= -damping; }
+
+    return vec4f(newVel, 0.0);
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.7  Integration pass  (Euler — mirrors integrateFsSource)
+    // -------------------------------------------------------------------------
+    const INTEGRATE_FS = /* wgsl */`
+@group(0) @binding(0) var u_posTex : texture_2d<f32>;
+@group(0) @binding(1) var u_velTex : texture_2d<f32>;
+
+const DT          : f32 = 0.005;
+const WORLD_BOUND : f32 = ${STR_WORLD_BOUND};
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
+    let pc      = vec2i(i32(fragCoord.x), i32(fragCoord.y));
+    let posData = textureLoad(u_posTex, pc, 0);
+    let myPos   = posData.xyz;
+    let pid     = posData.w; // preserve original ID in .w
+
+    let myVel = textureLoad(u_velTex, pc, 0).xyz;
+    var newPos = myPos + myVel * DT;
+
+    // Hard clamp (identical to WebGL2)
+    newPos = clamp(newPos, vec3f(0.01), vec3f(WORLD_BOUND));
+
+    return vec4f(newPos, pid);
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.8  Render vertex shader  (points — mirrors renderVsSource)
+    //
+    //      NOTE on NDC depth (see detailed notes at end of file):
+    //      WebGL2 NDC z ∈ [-1,1]; WebGPU NDC z ∈ [0,1].
+    //      The WebGL2 projection formula gives z_ndc = camPos.z / (-camPos.z) = -1
+    //      for every particle (near plane).  The equivalent in WebGPU is z_ndc = 0.
+    //      We achieve this by setting the z component to 0.0 in clip space
+    //      (clip.z = 0, clip.w = -camPos.z → NDC z = 0/w = 0). ✓
+    // -------------------------------------------------------------------------
+    const RENDER_VS = /* wgsl */`
+struct RenderUniforms { aspect : f32 }
+
+@group(0) @binding(0) var<uniform>  u_uniforms : RenderUniforms;
+@group(0) @binding(1) var           u_posTex   : texture_2d<f32>;
+
+const TEXT_WIDTH : i32 = ${STR_TEXT_WIDTH};
+const HALF_WORLD : f32 = ${STR_HALF_WORLD};
+
+struct VsOut {
+    @builtin(position)  position  : vec4f,
+    @builtin(point_size) pointSize: f32,   // mirrors gl_PointSize
+    @location(0)        depth     : f32,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vIdx: u32) -> VsOut {
+    let xi = i32(vIdx) % TEXT_WIDTH;
+    let yi = i32(vIdx) / TEXT_WIDTH;
+    let pos = textureLoad(u_posTex, vec2i(xi, yi), 0).xyz;
+
+    // 1. Centre the volume at origin  (identical to WebGL2)
+    let cPos = pos - vec3f(HALF_WORLD);
+
+    // 2. Y-axis rotation  ~-45 deg   (identical mat3 to WebGL2's rotY, column-major)
+    let ry    = -0.785;
+    let cosRy = cos(ry);
+    let sinRy = sin(ry);
+    // mat3x3f constructor fills values column-by-column, same as GLSL mat3()
+    let rotY  = mat3x3f(
+         cosRy, 0.0, sinRy,
+         0.0,   1.0, 0.0,
+        -sinRy, 0.0, cosRy
+    );
+
+    // 3. X-axis rotation  ~-30 deg   (identical mat3 to WebGL2's rotX)
+    let rx    = -0.523;
+    let cosRx = cos(rx);
+    let sinRx = sin(rx);
+    let rotX  = mat3x3f(
+        1.0, 0.0,    0.0,
+        0.0, cosRx, -sinRx,
+        0.0, sinRx,  cosRx
+    );
+
+    // 4. Apply rotations and push back (identical to WebGL2)
+    let rotated  = rotX * (rotY * cPos);
+    let camPos   = vec3f(rotated.x, rotated.y, rotated.z - 60.0);
+
+    let depth    = camPos.z;             // passed to fragment for colour shading
+    let fov      : f32 = 1.0;
+    let w        : f32 = -camPos.z;      // w = -z  (positive, since z < 0)
+
+    // 5. Manual perspective projection
+    //    clip.xy identical to WebGL2; clip.z = 0.0 (near plane, WebGPU [0,1] NDC)
+    let cx = (camPos.x * fov / u_uniforms.aspect);
+    let cy = (camPos.y * fov);
+
+    var o : VsOut;
+    o.position  = vec4f(cx, cy, 0.0, w);            // WebGPU clip space
+    o.pointSize = max(1.0, 200.0 / max(0.001, w));  // mirrors gl_PointSize formula
+    o.depth     = depth;
+    return o;
+}
+`;
+
+    // -------------------------------------------------------------------------
+    // 4.9  Render fragment shader  (depth-based colour — mirrors renderFsSource)
+    // -------------------------------------------------------------------------
+    const RENDER_FS = /* wgsl */`
+@fragment
+fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
+    // Identical formula to WebGL2
+    let df = clamp((depth + 90.0) / 60.0, 0.2, 1.0);
+    return vec4f(0.2 * df, 0.6 * df, 1.0 * df, 1.0);
+}
+`;
+
+    // =========================================================================
+    // 5. BIND GROUP LAYOUTS
+    //    sampleType: 'unfilterable-float' is the correct type for rgba32float
+    //    when used with textureLoad() — no sampler / feature required.
+    // =========================================================================
+
+    // Helper: BGL with N input textures + optional uniform buffer at last binding
+    function makeTexBGL(nTextures, hasUniform = false, uniformStage = GPUShaderStage.FRAGMENT) {
+        const entries = [];
+        for (let i = 0; i < nTextures; i++) {
+            entries.push({
+                binding:    i,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture:    { sampleType: 'unfilterable-float' },
+            });
+        }
+        if (hasUniform) {
+            entries.push({
+                binding:    nTextures,
+                visibility: uniformStage,
+                buffer:     { type: 'uniform' },
+            });
+        }
+        return device.createBindGroupLayout({ entries });
+    }
+
+    const hashBGL     = makeTexBGL(1);                    // 1 tex
+    // Sort BGL: uniform first (binding 0), texture second (binding 1)
+    const sortBGL     = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer:  { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+        ],
+    });
+    const scanBGL     = makeTexBGL(1);                    // 1 tex
+    const densityBGL  = makeTexBGL(3);                    // 3 tex
+    const forceBGL    = makeTexBGL(5);                    // 5 tex
+    const integrateBGL= makeTexBGL(2);                    // 2 tex
+    // Render BGL: uniform (binding 0, vertex stage), texture (binding 1, vertex stage)
+    const renderBGL   = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.VERTEX, buffer:  { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.VERTEX, texture: { sampleType: 'unfilterable-float' } },
+        ],
+    });
+
+    // =========================================================================
+    // 6. PIPELINE CREATION
+    //    All GPGPU pipelines: triangle-list topology, rgba32float target, no depth.
+    //    Render pipeline:     point-list topology, canvas format target, depth test.
+    // =========================================================================
+
+    // Helper: compile a shader module
+    function makeShaderModule(label, code) {
+        const m = device.createShaderModule({ label, code });
+        // Async error logging (non-blocking, mirrors WebGL2's getShaderInfoLog)
+        if (m.getCompilationInfo) {
+            m.getCompilationInfo().then(info => {
+                for (const msg of info.messages) {
+                    if (msg.type === 'error') {
+                        console.error(`[${label}] shader error at line ${msg.lineNum}: ${msg.message}`);
+                    }
+                }
+            });
+        }
+        return m;
+    }
+
+    // Helper: build a GPGPU render pipeline targeting rgba32float
+    function makeGPGPUPipeline(label, vsCode, fsCode, bgl) {
+        const vsMod = makeShaderModule(label + '_vs', vsCode);
+        const fsMod = makeShaderModule(label + '_fs', fsCode);
+        return device.createRenderPipeline({
+            label,
+            layout:   device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            vertex:   {
+                module:     vsMod,
+                entryPoint: 'vs_main',
+                buffers:    [QUAD_VBL],         // matches WebGL2's quadVAO binding
+            },
+            fragment: {
+                module:     fsMod,
+                entryPoint: 'fs_main',
+                targets:    [{ format: DATA_TEX_FORMAT }],
+            },
+            primitive: { topology: 'triangle-list' },
+        });
+    }
+
+    // GPGPU pipelines
+    const hashPipeline     = makeGPGPUPipeline('hash',     QUAD_VS, HASH_FS,     hashBGL);
+    const sortPipeline     = makeGPGPUPipeline('sort',     QUAD_VS, SORT_FS,     sortBGL);
+    const scanPipeline     = makeGPGPUPipeline('scan',     QUAD_VS, SCAN_FS,     scanBGL);
+    const densityPipeline  = makeGPGPUPipeline('density',  QUAD_VS, DENSITY_FS,  densityBGL);
+    const forcePipeline    = makeGPGPUPipeline('force',    QUAD_VS, FORCE_FS,    forceBGL);
+    const integratePipeline= makeGPGPUPipeline('integrate',QUAD_VS, INTEGRATE_FS,integrateBGL);
+
+    // Render pipeline (particles as points, with depth test)
+    const renderVsMod = makeShaderModule('render_vs', RENDER_VS);
+    const renderFsMod = makeShaderModule('render_fs', RENDER_FS);
+    const renderPipeline = device.createRenderPipeline({
+        label:  'render-particles',
+        layout:  device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
+        vertex:  {
+            module:     renderVsMod,
+            entryPoint: 'vs_main',
+            buffers:    [],   // no vertex buffer; positions come from texture via vertex_index
+        },
+        fragment: {
+            module:     renderFsMod,
+            entryPoint: 'fs_main',
+            targets:    [{ format: canvasFormat }],
+        },
+        primitive:    { topology: 'point-list' },
+        depthStencil: {
+            format:           'depth24plus',
+            depthWriteEnabled: true,
+            depthCompare:     'less',
+        },
+    });
+
+    // =========================================================================
+    // 7. BIND GROUP FACTORIES
+    //    Thin wrappers created inside stepSimulation() per-frame,
+    //    just as WebGL2 sets uniforms per-frame with gl.uniform1i().
+    // =========================================================================
+
+    function makeHashBG(posTex) {
+        return device.createBindGroup({
+            layout: hashBGL,
+            entries: [{ binding: 0, resource: posTex.createView() }],
+        });
+    }
+
+    // Sort BG: uniform buffer (binding 0), sort texture (binding 1)
+    function makeSortBG(uniformBuf, sortTex) {
+        return device.createBindGroup({
+            layout: sortBGL,
+            entries: [
+                { binding: 0, resource: { buffer: uniformBuf } },
+                { binding: 1, resource: sortTex.createView() },
+            ],
+        });
+    }
+
+    function makeScanBG(sortTex) {
+        return device.createBindGroup({
+            layout: scanBGL,
+            entries: [{ binding: 0, resource: sortTex.createView() }],
+        });
+    }
+
+    function makeDensityBG(posTex, sortTex, grid) {
+        return device.createBindGroup({
+            layout: densityBGL,
+            entries: [
+                { binding: 0, resource: posTex.createView()  },
+                { binding: 1, resource: sortTex.createView() },
+                { binding: 2, resource: grid.createView()    },
+            ],
+        });
+    }
+
+    function makeForceBG(posTex, velTex, densTex, sortTex, grid) {
+        return device.createBindGroup({
+            layout: forceBGL,
+            entries: [
+                { binding: 0, resource: posTex.createView()  },
+                { binding: 1, resource: velTex.createView()  },
+                { binding: 2, resource: densTex.createView() },
+                { binding: 3, resource: sortTex.createView() },
+                { binding: 4, resource: grid.createView()    },
+            ],
+        });
+    }
+
+    function makeIntegrateBG(posTex, velTex) {
+        return device.createBindGroup({
+            layout: integrateBGL,
+            entries: [
+                { binding: 0, resource: posTex.createView() },
+                { binding: 1, resource: velTex.createView() },
+            ],
+        });
+    }
+
+    function makeRenderBG(posTex) {
+        return device.createBindGroup({
+            layout: renderBGL,
+            entries: [
+                { binding: 0, resource: { buffer: aspectUniformBuf } },
+                { binding: 1, resource: posTex.createView()          },
+            ],
+        });
+    }
+
+    // =========================================================================
+    // 8. CORE SIMULATION STEP
+    //    Mirrors WebGL2's stepSimulation() exactly in pass order and data flow.
+    //    All GPU commands are batched into a single command encoder per step,
+    //    which is submitted atomically — equivalent to how the WebGL2 driver
+    //    queues and flushes GL commands.
+    // =========================================================================
+    function stepSimulation() {
+        const enc = device.createCommandEncoder({ label: 'sim-step' });
+
+        // Inner helper: run one GPGPU render pass to an rgba32float texture target.
+        // Mirrors WebGL2's pattern of:
+        //   gl.bindFramebuffer(FBO) → gl.viewport() → gl.useProgram() → gl.drawArrays()
+        function gpuPass(pipeline, bindGroup, outTex, w, h) {
+            const rp = enc.beginRenderPass({
+                colorAttachments: [{
+                    view:     outTex.createView(),
+                    loadOp:  'load',    // don't clear — we overwrite every texel
+                    storeOp: 'store',
+                }],
+            });
+            rp.setPipeline(pipeline);
+            rp.setBindGroup(0, bindGroup);
+            rp.setVertexBuffer(0, quadVertexBuffer); // mirrors gl.bindVertexArray(quadVAO)
+            rp.setViewport(0, 0, w, h, 0, 1);        // mirrors gl.viewport(0,0,w,h)
+            rp.draw(6);                               // mirrors gl.drawArrays(TRIANGLES,0,6)
+            rp.end();
+        }
+
+        // ------------------------------------------------------------------
+        // PASS 1: Spatial Hashing
+        //   Input:  readState.posTex
+        //   Output: sortTexA  (always starts hash result in A)
+        // ------------------------------------------------------------------
+        gpuPass(hashPipeline, makeHashBG(readState.posTex),
+                sortTexA, TEXT_WIDTH, TEXT_HEIGHT);
+
+        // ------------------------------------------------------------------
+        // PASS 2: Bitonic Sort  (N log²N / 2 render passes)
+        //   Ping-pongs between sortTexA and sortTexB, consuming one
+        //   pre-built uniform buffer per iteration.
+        // ------------------------------------------------------------------
+        let sortReadTex  = sortTexA;
+        let sortWriteTex = sortTexB;
+
+        for (let iter = 0; iter < sortIterations.length; iter++) {
+            gpuPass(sortPipeline,
+                    makeSortBG(sortUniformBuffers[iter], sortReadTex),
+                    sortWriteTex, TEXT_WIDTH, TEXT_HEIGHT);
+            // Swap sort ping-pong (mirrors WebGL2's local currentSortRead/Write swap)
+            const tmp    = sortReadTex;
+            sortReadTex  = sortWriteTex;
+            sortWriteTex = tmp;
+        }
+        // sortReadTex now holds the fully sorted array (same as WebGL2's currentSortReadTex)
+
+        // ------------------------------------------------------------------
+        // PASS 3: Grid Scanner
+        //   Input:  sortReadTex (sorted particle array)
+        //   Output: gridTex
+        // ------------------------------------------------------------------
+        gpuPass(scanPipeline, makeScanBG(sortReadTex),
+                gridTex, GRID_WIDTH, GRID_HEIGHT);
+
+        // ------------------------------------------------------------------
+        // PASS 4: Density Calculation
+        //   Inputs:  readState.posTex, sortReadTex, gridTex
+        //   Output:  densityTex
+        // ------------------------------------------------------------------
+        gpuPass(densityPipeline,
+                makeDensityBG(readState.posTex, sortReadTex, gridTex),
+                densityTex, TEXT_WIDTH, TEXT_HEIGHT);
+
+        // ------------------------------------------------------------------
+        // PASS 5: Force Calculation
+        //   Inputs:  readState.posTex, readState.velTex, densityTex, sortReadTex, gridTex
+        //   Output:  writeState.velTex  (new velocities)
+        // ------------------------------------------------------------------
+        gpuPass(forcePipeline,
+                makeForceBG(readState.posTex, readState.velTex,
+                            densityTex, sortReadTex, gridTex),
+                writeState.velTex, TEXT_WIDTH, TEXT_HEIGHT);
+
+        // ------------------------------------------------------------------
+        // PASS 6: Integration
+        //   Inputs:  readState.posTex, writeState.velTex  (just-written velocities!)
+        //   Output:  writeState.posTex
+        // ------------------------------------------------------------------
+        gpuPass(integratePipeline,
+                makeIntegrateBG(readState.posTex, writeState.velTex),
+                writeState.posTex, TEXT_WIDTH, TEXT_HEIGHT);
+
+        // Submit the entire step as one command buffer
+        device.queue.submit([enc.finish()]);
+
+        // Swap ping-pong state (mirrors WebGL2's swapPingPong())
+        swapPingPong();
+    }
+
+    // =========================================================================
+    // 9. RENDER LOOP  (mirrors WebGL2's renderLoop)
+    // =========================================================================
+    let isRendering    = false;
+    let animFrameId    = null;
+
+    function renderLoop() {
+        if (!isRendering) return;
+
+        const stepsPerFrame = parseInt(document.getElementById('steps-input').value) || 1;
+        for (let i = 0; i < stepsPerFrame; i++) stepSimulation();
+
+        // Update aspect ratio (mirrors WebGL2's per-frame gl.uniform1f call)
+        device.queue.writeBuffer(aspectUniformBuf, 0,
+            new Float32Array([canvas.width / canvas.height, 0, 0, 0]));
+
+        // Render pass to screen (mirrors WebGL2's render pass block)
+        const enc         = device.createCommandEncoder({ label: 'render-frame' });
+        const swapView    = gpuContext.getCurrentTexture().createView();
+
+        const rp = enc.beginRenderPass({
+            colorAttachments: [{
+                view:       swapView,
+                clearValue: [0.05, 0.05, 0.05, 1.0],   // mirrors gl.clearColor(0.05...)
+                loadOp:    'clear',                       // mirrors gl.clear(COLOR_BUFFER_BIT)
+                storeOp:   'store',
+            }],
+            depthStencilAttachment: {
+                view:            depthTexture.createView(),
+                depthClearValue: 1.0,                    // mirrors gl.clear(DEPTH_BUFFER_BIT)
+                depthLoadOp:    'clear',
+                depthStoreOp:   'discard',
+            },
+        });
+
+        rp.setPipeline(renderPipeline);
+        rp.setBindGroup(0, makeRenderBG(readState.posTex));
+        // NO vertex buffer — vertex shader uses @builtin(vertex_index) to index the texture
+        // mirrors: gl.bindVertexArray(null); gl.drawArrays(POINTS, 0, PARTICLE_COUNT)
+        rp.draw(PARTICLE_COUNT);
+        rp.end();
+
+        device.queue.submit([enc.finish()]);
+
+        animFrameId = requestAnimationFrame(renderLoop);
+    }
+
+    // =========================================================================
+    // 10. GPU SYNC BARRIER
+    //     Mirrors WebGL2's forceGpuSync() which reads 1 pixel via readPixels()
+    //     to create a CPU-GPU synchronisation fence.
+    //     In WebGPU this is achieved by copying 1 texel to a MAP_READ buffer
+    //     and awaiting the map — equivalent mechanism, slightly different API.
+    // =========================================================================
+    async function forceGpuSync() {
+        const enc = device.createCommandEncoder({ label: 'sync-fence' });
+        // Copy exactly 1 pixel from the position texture (4 × float32 = 16 bytes)
+        // bytesPerRow must be ≥ 256 per WebGPU spec, hence the 256-byte syncBuffer
+        enc.copyTextureToBuffer(
+            { texture: readState.posTex, origin: [0, 0, 0] },
+            { buffer: syncBuffer, bytesPerRow: 256 },
+            [1, 1, 1]
+        );
+        device.queue.submit([enc.finish()]);
+        // mapAsync creates the same CPU stall as WebGL2's synchronous readPixels
+        await syncBuffer.mapAsync(GPUMapMode.READ);
+        syncBuffer.unmap();
+    }
+
+    // =========================================================================
+    // 11. HEADLESS BENCHMARK
+    //     Identical differential timing trick to WebGL2's runBenchmark().
+    //     Made async to accommodate WebGPU's async fence API.
+    // =========================================================================
+    async function runBenchmark() {
+        isRendering = false;
+        if (animFrameId) cancelAnimationFrame(animFrameId);
+
+        statsDiv.innerText = 'Running Benchmark...\nPhase 1: Timing 10 steps...';
+
+        // Let the browser paint the status text before locking the main thread
+        await new Promise(r => setTimeout(r, 50));
+
+        // --- PHASE 1: Time 10 steps ---
+        const start10 = performance.now();
+        for (let i = 0; i < 10; i++) stepSimulation();
+        await forceGpuSync();
+        const end10   = performance.now();
+        const time10  = end10 - start10;
+
+        statsDiv.innerText = 'Running Benchmark...\nPhase 2: Timing 60 steps...';
+        await new Promise(r => setTimeout(r, 50));
+
+        // --- PHASE 2: Time 60 steps ---
+        const start60 = performance.now();
+        for (let i = 0; i < 60; i++) stepSimulation();
+        await forceGpuSync();
+        const end60   = performance.now();
+        const time60  = end60 - start60;
+
+        // --- PHASE 3: Differential math  (identical to WebGL2) ---
+        const pureGpuTime50 = time60 - time10;
+        const timePerStep   = pureGpuTime50 / 50;
+        const pureGpuTime10 = timePerStep * 10;
+        const overhead      = time10 - pureGpuTime10;
+        const stepsPerSecond= 50 / (pureGpuTime50 / 1000);
+
+        statsDiv.innerText =
+            `--- WebGPU Benchmark Complete ---\n`                                    +
+            `Particles: ${PARTICLE_COUNT}\n\n`                                       +
+            `[Raw Measurements]\n`                                                   +
+            `Time for 10 steps (T10): ${time10.toFixed(2)} ms\n`                    +
+            `Time for 60 steps (T60): ${time60.toFixed(2)} ms\n\n`                  +
+            `[Differential Math]\n`                                                  +
+            `Compute Time (50 steps) = T60 - T10\n`                                 +
+            `                        = ${time60.toFixed(2)} - ${time10.toFixed(2)}\n` +
+            `                        = ${pureGpuTime50.toFixed(2)} ms\n\n`          +
+            `[Derived Metrics]\n`                                                    +
+            `Time per step (Compute + JS): ${timePerStep.toFixed(2)} ms\n`          +
+            `Fixed Sync/Driver Overhead:   ${overhead.toFixed(2)} ms\n`             +
+            `Throughput:                   ${stepsPerSecond.toFixed(2)} SPS`;
+    }
+
+    // =========================================================================
+    // 12. TRIGGER  (mirrors WebGL2's if(isRenderMode) block at end of builder)
+    // =========================================================================
+    if (isRenderMode) {
+        isRendering = true;
+        statsDiv.innerText = 'Running Render Mode...\nWatch the cache burn.';
+        renderLoop();
+    } else {
+        runBenchmark();
+    }
+
+    console.log(`Initialized WebGPU Pipeline. Particles: ${PARTICLE_COUNT}`);
+
+} // <-- closes buildPipelineAndStart()
+
+// =============================================================================
+// 13. UI EVENT LISTENERS  (identical to WebGL2 section 4.5)
+// =============================================================================
+document.getElementById('btn-low').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Simulation already running! Please refresh to change modes.');
+    simMode = 'low';
+    statsDiv.innerText = 'Mode: Low (16k, 32^3) Selected.\nAwaiting start...';
+});
+
+document.getElementById('btn-high').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Simulation already running! Please refresh to change modes.');
+    simMode = 'high';
+    statsDiv.innerText = 'Mode: High (65k, 32^3) Selected.\nAwaiting start...';
+});
+
+document.getElementById('btn-low-small').addEventListener('click', () => {
+    if (isPipelineBuilt) return alert('Simulation already running! Please refresh to change modes.');
+    simMode = 'low_small';
+    statsDiv.innerText = 'Mode: Low Reduced Size (16k, 16^3) Selected.\nAwaiting start...';
+});
+
+document.getElementById('btn-render').addEventListener('click', () => {
+    buildPipelineAndStart(true).catch(e => {
+        statsDiv.innerText = 'ERROR: ' + e.message;
+        console.error(e);
+    });
+});
+
+document.getElementById('btn-headless').addEventListener('click', () => {
+    buildPipelineAndStart(false).catch(e => {
+        statsDiv.innerText = 'ERROR: ' + e.message;
+        console.error(e);
+    });
+});
+
+statsDiv.innerText = 'Mode: Low (16k) Default.\nSelect Mode, then press Start.';
+console.log('WebGPU Pipeline ready to build. Waiting for user to press Start...');
+</script>
+</body>
+</html>
