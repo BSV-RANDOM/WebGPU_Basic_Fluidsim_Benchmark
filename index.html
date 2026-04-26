@@ -945,12 +945,13 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         // Inner helper: run one GPGPU render pass to an rgba32float texture target.
         // Mirrors WebGL2's pattern of:
         //   gl.bindFramebuffer(FBO) → gl.viewport() → gl.useProgram() → gl.drawArrays()
-        function gpuPass(pipeline, bindGroup, outTex, w, h) {
+        function gpuPass(pipeline, bindGroup, outTex, w, h) { //FIX: turns out webgpu is stricter than webgl2 when it comes to overwriting pixels. will need to clear first.
             const rp = enc.beginRenderPass({
                 colorAttachments: [{
-                    view:     outTex.createView(),
-                    loadOp:  'load',    // don't clear — we overwrite every texel
-                    storeOp: 'store',
+                    view:       outTex.createView(),
+                    clearValue: [0.0, 0.0, 0.0, 0.0],
+                    loadOp:     'clear', 
+                    storeOp:    'store',
                 }],
             });
             rp.setPipeline(pipeline);
