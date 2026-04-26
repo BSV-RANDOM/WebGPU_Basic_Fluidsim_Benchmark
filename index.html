@@ -671,8 +671,7 @@ const HALF_WORLD : f32 = ${STR_HALF_WORLD};
 
 struct VsOut {
     @builtin(position)  position  : vec4f,
-    @builtin(point_size) pointSize: f32,   // mirrors gl_PointSize
-    @location(0)        depth     : f32,
+    @location(0)        depth     : f32,   //fixing some LLM hallucinations
 }
 
 @vertex
@@ -720,8 +719,7 @@ fn vs_main(@builtin(vertex_index) vIdx: u32) -> VsOut {
 
     var o : VsOut;
     o.position  = vec4f(cx, cy, 0.0, w);            // WebGPU clip space
-    o.pointSize = max(1.0, 200.0 / max(0.001, w));  // mirrors gl_PointSize formula
-    o.depth     = depth;
+    o.depth     = depth;  // more fixes
     return o;
 }
 `;
@@ -855,7 +853,7 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         depthStencil: {
             format:           'depth24plus',
             depthWriteEnabled: true,
-            depthCompare:     'less',
+            depthCompare:     'always',
         },
     });
 
