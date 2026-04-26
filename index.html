@@ -39,7 +39,7 @@ const statsDiv = document.getElementById('stats');
 const oldError = console.error;
 console.error = function(...args) {
     oldError(...args);
-    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+    const msg = args.map(a => (a && a.message) ? a.message : (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ');
     statsDiv.innerText += '\n[ERR]: ' + msg;
 };
 
@@ -215,13 +215,17 @@ async function buildPipelineAndStart(isRenderMode) {
 
     // One tiny uniform buffer per (k,j) pair, written once at startup.
     // 16 bytes = minimum uniform buffer size in WebGPU.
-   const sortUniformBuffers = sortIterations.map(({ k, j }) => {
+   const sortPassData = sortIterations.map(({ k, j }) => {
         const buf = device.createBuffer({
             size:  16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(buf, 0, new Uint32Array([k, j, 0, 0]));
-        return buf;
+        return {
+            buf,
+            bgReadA: makeSortBG(buf, sortBufA, sortBufB),
+            bgReadB: makeSortBG(buf, sortBufB, sortBufA)
+        };
     });
 
     // Aspect-ratio uniform for the render pass (updated each frame)
@@ -845,6 +849,34 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
             { binding: 1, resource: { buffer: posBuf } },
         ]});
     }
+
+    // Pre-bake all possible Bind Group combinations to prevent OOM crashes!
+    const bgCache = {
+        hashA: makeHashBG(posBufA, sortBufA),
+        hashB: makeHashBG(posBufB, sortBufA),
+
+        scanA: makeScanBG(sortBufA, gridBuf),
+        scanB: makeScanBG(sortBufB, gridBuf),
+
+        den_PosA_SortA: makeDensityBG(posBufA, sortBufA, gridBuf, densityBuf),
+        den_PosA_SortB: makeDensityBG(posBufA, sortBufB, gridBuf, densityBuf),
+        den_PosB_SortA: makeDensityBG(posBufB, sortBufA, gridBuf, densityBuf),
+        den_PosB_SortB: makeDensityBG(posBufB, sortBufB, gridBuf, densityBuf),
+
+        force_PosA_SortA: makeForceBG(posBufA, velBufA, densityBuf, sortBufA, gridBuf, velBufB),
+        force_PosA_SortB: makeForceBG(posBufA, velBufA, densityBuf, sortBufB, gridBuf, velBufB),
+        force_PosB_SortA: makeForceBG(posBufB, velBufB, densityBuf, sortBufA, gridBuf, velBufA),
+        force_PosB_SortB: makeForceBG(posBufB, velBufB, densityBuf, sortBufB, gridBuf, velBufA),
+
+        intA: makeIntegrateBG(posBufA, velBufB, posBufB),
+        intB: makeIntegrateBG(posBufB, velBufA, posBufA),
+
+        renderA: makeRenderBG(posBufA),
+        renderB: makeRenderBG(posBufB)
+    };
+
+
+    
     // =========================================================================
     // 8. CORE SIMULATION STEP
     //    Mirrors WebGL2's stepSimulation() exactly in pass order and data flow.
@@ -854,54 +886,56 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
     // =========================================================================
     function stepSimulation() {
         const enc = device.createCommandEncoder({ label: 'sim-step' });
-        const cp = enc.beginComputePass(); // One compute pass for all physics!
+        const cp = enc.beginComputePass();
 
         function dispatchPass(pipeline, bindGroup, threadCount) {
             cp.setPipeline(pipeline);
             cp.setBindGroup(0, bindGroup);
-            // Dispatch enough workgroups of size 64 to cover all items
             cp.dispatchWorkgroups(Math.ceil(threadCount / WORKGROUP_SIZE));
         }
 
+        const isPosA = readState.posBuf === posBufA;
+
         // 1. Hash
-        dispatchPass(hashPipeline, makeHashBG(readState.posBuf, sortBufA), PARTICLE_COUNT);
+        dispatchPass(hashPipeline, isPosA ? bgCache.hashA : bgCache.hashB, PARTICLE_COUNT);
 
         // 2. Sort
-        let sortReadBuf  = sortBufA;
-        let sortWriteBuf = sortBufB;
-        for (let iter = 0; iter < sortIterations.length; iter++) {
-            dispatchPass(sortPipeline, 
-                         makeSortBG(sortUniformBuffers[iter], sortReadBuf, sortWriteBuf), 
-                         PARTICLE_COUNT);
-            const tmp    = sortReadBuf;
-            sortReadBuf  = sortWriteBuf;
-            sortWriteBuf = tmp;
+        let isSortA = true; // Always starts reading from sortBufA
+        for (let iter = 0; iter < sortPassData.length; iter++) {
+            const stepData = sortPassData[iter];
+            dispatchPass(sortPipeline, isSortA ? stepData.bgReadA : stepData.bgReadB, PARTICLE_COUNT);
+            isSortA = !isSortA; // Swap read state
         }
 
-        // 3. Scan Grid (Dispatches over total grid cells, NOT particle count!)
+        // 3. Scan
         const totalCells = GRID_WIDTH * GRID_HEIGHT;
-        dispatchPass(scanPipeline, makeScanBG(sortReadBuf, gridBuf), totalCells);
+        dispatchPass(scanPipeline, isSortA ? bgCache.scanA : bgCache.scanB, totalCells);
 
         // 4. Density
-        dispatchPass(densityPipeline, 
-                     makeDensityBG(readState.posBuf, sortReadBuf, gridBuf, densityBuf), 
-                     PARTICLE_COUNT);
+        let denBG;
+        if (isPosA && isSortA) denBG = bgCache.den_PosA_SortA;
+        else if (isPosA && !isSortA) denBG = bgCache.den_PosA_SortB;
+        else if (!isPosA && isSortA) denBG = bgCache.den_PosB_SortA;
+        else denBG = bgCache.den_PosB_SortB;
+        dispatchPass(densityPipeline, denBG, PARTICLE_COUNT);
 
         // 5. Force
-        dispatchPass(forcePipeline, 
-                     makeForceBG(readState.posBuf, readState.velBuf, densityBuf, sortReadBuf, gridBuf, writeState.velBuf), 
-                     PARTICLE_COUNT);
+        let forceBG;
+        if (isPosA && isSortA) forceBG = bgCache.force_PosA_SortA;
+        else if (isPosA && !isSortA) forceBG = bgCache.force_PosA_SortB;
+        else if (!isPosA && isSortA) forceBG = bgCache.force_PosB_SortA;
+        else forceBG = bgCache.force_PosB_SortB;
+        dispatchPass(forcePipeline, forceBG, PARTICLE_COUNT);
 
         // 6. Integrate
-        dispatchPass(integratePipeline, 
-                     makeIntegrateBG(readState.posBuf, writeState.velBuf, writeState.posBuf), 
-                     PARTICLE_COUNT);
+        dispatchPass(integratePipeline, isPosA ? bgCache.intA : bgCache.intB, PARTICLE_COUNT);
 
         cp.end();
         device.queue.submit([enc.finish()]);
 
         swapPingPong();
     }
+    
     // =========================================================================
     // 9. RENDER LOOP  (mirrors WebGL2's renderLoop)
     // =========================================================================
@@ -938,7 +972,8 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         });
 
         rp.setPipeline(renderPipeline);
-        rp.setBindGroup(0, makeRenderBG(readState.posBuf));
+        const isPosA = readState.posBuf === posBufA;
+        rp.setBindGroup(0, isPosA ? bgCache.renderA : bgCache.renderB);
         rp.draw(PARTICLE_COUNT);
         rp.end();
 
