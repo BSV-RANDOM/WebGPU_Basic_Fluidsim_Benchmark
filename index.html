@@ -17,7 +17,7 @@
     <label for="steps-input" style="margin-right: 5px; font-size: 14px;">Steps/Frame:</label>
     <input type="number" id="steps-input" value="5" min="1" max="50"
         style="margin-right: 15px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; padding: 8px 5px; width: 50px;">
-    <button id="btn-low">Low Mode (16k)</button>
+    <button id="btn-low">Low Mode (16k_s)</button>
     <button id="btn-high">High Mode (65k)</button>
     <button id="btn-low-small">Low Reduced Size (16k, 16^3)</button>
     <button id="btn-render">Start Render Mode</button>
@@ -213,20 +213,7 @@ async function buildPipelineAndStart(isRenderMode) {
         }
     }
 
-    // One tiny uniform buffer per (k,j) pair, written once at startup.
-    // 16 bytes = minimum uniform buffer size in WebGPU.
-   const sortPassData = sortIterations.map(({ k, j }) => {
-        const buf = device.createBuffer({
-            size:  16,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        device.queue.writeBuffer(buf, 0, new Uint32Array([k, j, 0, 0]));
-        return {
-            buf,
-            bgReadA: makeSortBG(buf, sortBufA, sortBufB),
-            bgReadB: makeSortBG(buf, sortBufB, sortBufA)
-        };
-    });
+
 
     // Aspect-ratio uniform for the render pass (updated each frame)
     const aspectUniformBuf = device.createBuffer({
@@ -843,15 +830,28 @@ fn fs_main(@location(0) depth: f32) -> @location(0) vec4f {
         ]});
     }
 
-    function makeRenderBG(posBuf) {
-        return device.createBindGroup({ layout: renderBGL, entries: [
-            { binding: 0, resource: { buffer: aspectUniformBuf } },
-            { binding: 1, resource: { buffer: posBuf } },
-        ]});
-    }
+   function makeRenderBG(posBuf) {
+            return device.createBindGroup({ layout: renderBGL, entries: [
+                { binding: 0, resource: { buffer: aspectUniformBuf } },
+                { binding: 1, resource: { buffer: posBuf } },
+            ]});
+        }
+        
+        const sortPassData = sortIterations.map(({ k, j }) => {
+            const buf = device.createBuffer({
+                size:  16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(buf, 0, new Uint32Array([k, j, 0, 0]));
+            return {
+                buf,
+                bgReadA: makeSortBG(buf, sortBufA, sortBufB),
+                bgReadB: makeSortBG(buf, sortBufB, sortBufA)
+            };
+        });
 
-    // Pre-bake all possible Bind Group combinations to prevent OOM crashes!
-    const bgCache = {
+        // Pre-bake all possible Bind Group combinations to prevent OOM crashes!
+        const bgCache = {
         hashA: makeHashBG(posBufA, sortBufA),
         hashB: makeHashBG(posBufB, sortBufA),
 
