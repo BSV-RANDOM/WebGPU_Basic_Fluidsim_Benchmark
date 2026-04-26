@@ -35,6 +35,14 @@ canvas.width  = window.innerWidth;
 canvas.height = window.innerHeight;
 const statsDiv = document.getElementById('stats');
 
+// --- MOBILE DEBUG HACK ---
+const oldError = console.error;
+console.error = function(...args) {
+    oldError(...args);
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+    statsDiv.innerText += '\n[ERR]: ' + msg;
+};
+
 // Deferred: device/context are created inside buildPipelineAndStart()
 // to match the WebGL2 pattern where WebGL is init'd lazily.
 let device       = null;
@@ -72,10 +80,11 @@ async function initWebGPU() {
     // (no sampler) so this is not strictly required, but it signals to the
     // driver that we intend to work with 32-bit float render targets.
     const wantedFeatures = [];
-    if (adapter.features.has('float32-filterable')) {
-        wantedFeatures.push('float32-filterable');
+    if (adapter.features.has('float32-renderable')) {
+        wantedFeatures.push('float32-renderable');
+    } else {
+        alert('WARNING: Your device does not support float32-renderable! The simulation will fail.');
     }
-
     device = await adapter.requestDevice({ requiredFeatures: wantedFeatures });
 
     device.addEventListener('uncapturederror', ev => {
